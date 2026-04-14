@@ -1,0 +1,14 @@
+.github/**
+.vscode/**
+assets/**
+src/**
+scripts/**
+dist/**/*.map
+vitest.config.ts
+tsconfig.json
+node_modules/**/.github/**
+node_modules/**/test/**
+node_modules/**/tests/**
+node_modules/**/__tests__/**
+node_modules/**/*.md
+node_modules/**/LICENSE*

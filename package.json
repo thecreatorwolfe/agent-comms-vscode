@@ -1,0 +1,108 @@
+{
+  "name": "agent-comms-vscode",
+  "displayName": "Agent Orchestration",
+  "description": "Coordinate Claude Code and OpenAI Codex agents via Slack from any VS Code workspace through a user-installed hub.",
+  "version": "0.2.13",
+  "publisher": "override-agency",
+  "private": false,
+  "engines": {
+    "vscode": "^1.85.0"
+  },
+  "extensionKind": [
+    "ui"
+  ],
+  "categories": [
+    "Other"
+  ],
+  "activationEvents": [
+    "onCommand:agentComms.start",
+    "onCommand:agentComms.stop",
+    "onCommand:agentComms.installGlobalBridges",
+    "onCommand:agentComms.setProject",
+    "onCommand:agentComms.showRegistry",
+    "onCommand:agentComms.spawn"
+  ],
+  "main": "./dist/extension.js",
+  "contributes": {
+    "commands": [
+      {
+        "command": "agentComms.start",
+        "title": "Agent Comms: Start Hub In This Workspace"
+      },
+      {
+        "command": "agentComms.stop",
+        "title": "Agent Comms: Stop Hub In This Workspace"
+      },
+      {
+        "command": "agentComms.installGlobalBridges",
+        "title": "Agent Comms: Install Global Bridges"
+      },
+      {
+        "command": "agentComms.setProject",
+        "title": "Agent Comms: Set Project Name"
+      },
+      {
+        "command": "agentComms.showRegistry",
+        "title": "Agent Comms: Show Live Registry"
+      },
+      {
+        "command": "agentComms.spawn",
+        "title": "Agent Comms: Spawn Agent"
+      }
+    ],
+    "configuration": {
+      "title": "Agent Comms",
+      "properties": {
+        "agentComms.envFilePath": {
+          "type": "string",
+          "default": "${userHome}/.agent-comms/.env",
+          "description": "Path to the Agent Comms env file. Set this in User settings for machine-wide use."
+        },
+        "agentComms.port": {
+          "type": "number",
+          "default": 47592,
+          "description": "Localhost port for the active Agent Comms hub. Only one workspace window can bind this port at a time."
+        },
+        "agentComms.codexChromeDevtoolsStartupTimeoutSec": {
+          "type": "number",
+          "default": 30,
+          "minimum": 1,
+          "description": "Startup timeout override applied to spawned Codex sessions for the chrome-devtools MCP server. This gives Chrome DevTools more time to initialize before Codex marks it failed."
+        },
+        "agentComms.slackIconsBaseUrl": {
+          "type": "string",
+          "default": "",
+          "description": "Public base URL for Slack persona icons. Slack must be able to fetch these images directly. Leave blank to use the app's default avatar instead of per-agent icons."
+        }
+      }
+    }
+  },
+  "scripts": {
+    "compile": "rm -rf dist && tsc -p ./",
+    "watch": "tsc -watch -p ./",
+    "test": "vitest run",
+    "test:watch": "vitest",
+    "lint": "tsc --noEmit",
+    "package": "npm run compile && vsce package",
+    "package:vsix": "npm run compile && vsce package"
+  },
+  "devDependencies": {
+    "@types/express": "^5.0.0",
+    "@types/node": "^22.0.0",
+    "@types/vscode": "^1.85.0",
+    "@types/ws": "^8.5.10",
+    "@vscode/vsce": "^3.0.0",
+    "pino-pretty": "^11.0.0",
+    "typescript": "^5.5.0",
+    "vitest": "^2.0.0"
+  },
+  "dependencies": {
+    "@modelcontextprotocol/sdk": "^1.29.0",
+    "@slack/bolt": "^4.0.0",
+    "dotenv": "^16.4.0",
+    "express": "^5.0.0",
+    "pino": "^9.0.0",
+    "ws": "^8.17.0",
+    "zod": "^3.23.0"
+  }
+}
