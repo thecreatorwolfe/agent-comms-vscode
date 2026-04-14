@@ -1,0 +1,54 @@
+import { describe, expect, it } from 'vitest';
+import {
+  parseAgentSlackEventText,
+  parseHumanSlackControl,
+  stripSlackUserMentions,
+} from '../slack/parse';
+
+describe('slack parsing', () => {
+  it('strips Slack user mentions before control parsing', () => {
+    expect(stripSlackUserMentions('<@U123> hello <@U999>')).toBe('hello');
+  });
+
+  it('accepts stop as the only non-destructive human Slack control', () => {
+    expect(parseHumanSlackControl('<@U123> stop')).toEqual({ command: 'stop' });
+  });
+
+  it('accepts stop kill as the destructive human Slack control', () => {
+    expect(parseHumanSlackControl('<@U123> stop kill')).toEqual({ command: 'stop_kill' });
+  });
+
+  it('ignores arbitrary human instructions from Slack', () => {
+    expect(parseHumanSlackControl('<@U123> @security-audit-codex-1 please review this diff')).toEqual({
+      command: 'ignore',
+      normalized: '@security-audit-codex-1 please review this diff',
+    });
+  });
+
+  it('parses bracketed agent protocol messages from the channel', () => {
+    const result = parseAgentSlackEventText(`[security-audit-codex-1→security-audit-alfred-1] TASK:bosa-phase0 | UTC:2026-04-14T00:30Z
+SUBJECT: API schema answer
+
+Here is the schema.`);
+
+    expect(result.route).toBe('agent_header');
+    if (result.route !== 'agent_header') {
+      throw new Error('unexpected route');
+    }
+
+    expect(result.message.recipients).toEqual(['security-audit-alfred-1']);
+    expect(result.message.taskId).toBe('bosa-phase0');
+  });
+
+  it('flags malformed agent protocol posts instead of routing them', () => {
+    const result = parseAgentSlackEventText(`[security-audit-codex-1→security-audit-alfred-1]
+not valid`);
+
+    expect(result.route).toBe('invalid_protocol');
+  });
+
+  it('ignores non-protocol channel chatter', () => {
+    const result = parseAgentSlackEventText('hello channel');
+    expect(result.route).toBe('unrouted');
+  });
+});
