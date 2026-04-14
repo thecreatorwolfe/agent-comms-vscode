@@ -1,5 +1,6 @@
 import path from 'node:path';
 import * as vscode from 'vscode';
+import type { Logger } from 'pino';
 import { loadAgentCommsEnv } from './env';
 import { ensureGlobalBridgeLaunchers } from './global';
 import { createLogger } from './log';
@@ -17,9 +18,11 @@ import { WsGateway } from './gateway/ws';
 import { PROJECT_OVERRIDE_KEY, resolveProjectName } from './persona/project';
 import { parseAutomaticPersona, resolveRecipientAlias } from './persona/naming';
 import { resolveIconUrl } from './persona/icons';
+import type { ParsedSlackMessage } from './schema/slack_message';
 import { validateSlackMessageText } from './schema/validate';
 import { spawnAgent, type SpawnRequest, type SpawnResult } from './spawn';
 import type { EventFrame } from './schema/frames';
+import { wakeProcessTty } from './wake';
 
 type OutboundRequest = {
   persona: string;
@@ -38,6 +41,40 @@ type RenameRequest = {
 };
 
 type RouteErrorReason = 'schema_invalid' | 'unknown_recipient' | 'slack_api_error';
+
+class RecentlyDeliveredSlackTs {
+  private readonly deliveredUntil = new Map<string, number>();
+
+  constructor(private readonly ttlMs = 60_000) {}
+
+  note(slackTs: string, now = Date.now()): void {
+    this.prune(now);
+    this.deliveredUntil.set(slackTs, now + this.ttlMs);
+  }
+
+  has(slackTs: string, now = Date.now()): boolean {
+    this.prune(now);
+    const expiresAt = this.deliveredUntil.get(slackTs);
+    if (!expiresAt) {
+      return false;
+    }
+
+    if (expiresAt <= now) {
+      this.deliveredUntil.delete(slackTs);
+      return false;
+    }
+
+    return true;
+  }
+
+  private prune(now: number): void {
+    for (const [slackTs, expiresAt] of this.deliveredUntil.entries()) {
+      if (expiresAt <= now) {
+        this.deliveredUntil.delete(slackTs);
+      }
+    }
+  }
+}
 
 function createRouteError(reason: RouteErrorReason, message: string, details?: unknown): Error & { reason: RouteErrorReason; details?: unknown } {
   return Object.assign(new Error(message), { reason, details });
@@ -345,7 +382,14 @@ async function handleInboundAgentMessage(
   registry: AgentRegistry,
   wsGateway: WsGateway,
   outputChannel: vscode.OutputChannel,
+  recentlyDeliveredSlackTs: RecentlyDeliveredSlackTs,
+  logger?: Logger,
 ): Promise<void> {
+  if (recentlyDeliveredSlackTs.has(event.ts)) {
+    outputChannel.appendLine(`[agent-comms] skipped duplicate local delivery for Slack ts ${event.ts}`);
+    return;
+  }
+
   const parsed = parseAgentSlackEventText(event.text);
   if (parsed.route === 'unrouted') {
     return;
@@ -356,19 +400,62 @@ async function handleInboundAgentMessage(
     return;
   }
 
-  const sender = parsed.message.from;
-  const { targets } = resolveEventTargets(registry, parsed.message.recipients, sender);
+  await deliverParsedAgentMessage(
+    parsed.message,
+    {
+      slackTs: event.ts,
+      threadTs: event.thread_ts ?? event.ts,
+    },
+    registry,
+    wsGateway,
+    outputChannel,
+    logger,
+  );
+}
+
+async function deliverParsedAgentMessage(
+  message: ParsedSlackMessage,
+  eventMeta: {
+    slackTs: string;
+    threadTs: string;
+  },
+  registry: AgentRegistry,
+  wsGateway: WsGateway,
+  outputChannel: vscode.OutputChannel,
+  logger?: Logger,
+): Promise<void> {
+  const sender = message.from;
+  const { targets } = resolveEventTargets(registry, message.recipients, sender);
   for (const target of targets) {
-    wsGateway.sendEvent({
+    const targetAgent = registry.get(target);
+    const wasIdle = targetAgent?.status === 'idle';
+    const delivered = wsGateway.sendEvent({
       type: 'event',
       from_persona: sender,
       to_persona: target,
-      thread_ts: event.thread_ts ?? event.ts,
-      task_id: parsed.message.taskId,
-      body_raw: parsed.message.body,
-      body_parsed: parsed.message,
-      slack_ts: event.ts,
+      thread_ts: eventMeta.threadTs,
+      task_id: message.taskId,
+      body_raw: message.body,
+      body_parsed: message,
+      slack_ts: eventMeta.slackTs,
     });
+
+    if (!delivered) {
+      outputChannel.appendLine(`[agent-comms] local delivery skipped for ${target} at ${eventMeta.slackTs}`);
+      continue;
+    }
+
+    if (!targetAgent || !wasIdle) {
+      continue;
+    }
+
+    registry.markResume(target, message.taskId);
+    const woke = await wakeProcessTty(targetAgent.pid, { logger });
+    outputChannel.appendLine(
+      woke
+        ? `[agent-comms] woke idle agent ${target} after inbound delivery`
+        : `[agent-comms] delivered inbound message to idle agent ${target}, but tty wake failed`,
+    );
   }
 }
 
@@ -377,6 +464,10 @@ async function handleOutboundRequest(
   registry: AgentRegistry,
   slack: ReturnType<typeof createSlackBoltRuntime>,
   env: ReturnType<typeof loadAgentCommsEnv>,
+  wsGateway: WsGateway,
+  outputChannel: vscode.OutputChannel,
+  recentlyDeliveredSlackTs: RecentlyDeliveredSlackTs,
+  logger?: Logger,
   slackIconsBaseUrl?: string,
 ): Promise<PostedSlackMessage> {
   const validation = validateSlackMessageText(payload.body);
@@ -412,7 +503,7 @@ async function handleOutboundRequest(
     throw createRouteError('schema_invalid', 'Unable to resolve sender kind', { persona: payload.persona });
   }
 
-  return postPersonaMessage({
+  const posted = await postPersonaMessage({
     client: slack.client,
     channel: env.SLACK_CHANNEL_ID,
     persona: payload.persona,
@@ -423,6 +514,21 @@ async function handleOutboundRequest(
     iconsBaseUrl: slackIconsBaseUrl,
     iconUrl: slackIconsBaseUrl ? undefined : null,
   });
+
+  recentlyDeliveredSlackTs.note(posted.slackTs);
+  await deliverParsedAgentMessage(
+    parsedBody,
+    {
+      slackTs: posted.slackTs,
+      threadTs: posted.threadTs,
+    },
+    registry,
+    wsGateway,
+    outputChannel,
+    logger,
+  );
+
+  return posted;
 }
 
 async function handleReadSlackHistory(
@@ -521,6 +627,7 @@ export async function bootstrap(context: vscode.ExtensionContext): Promise<Agent
 
   const registry = new AgentRegistry({ logger });
   const terminals = new SpawnedTerminalRegistry();
+  const recentlyDeliveredSlackTs = new RecentlyDeliveredSlackTs();
   context.subscriptions.push(
     vscode.window.onDidCloseTerminal((terminal) => {
       terminals.untrackTerminal(terminal);
@@ -546,7 +653,17 @@ export async function bootstrap(context: vscode.ExtensionContext): Promise<Agent
         trackTerminal: (persona, terminal) => terminals.track(persona, terminal),
         logger,
       }),
-    onOutbound: async (request) => handleOutboundRequest(request, registry, slackRuntime, env, slackIconsBaseUrl),
+    onOutbound: async (request) => handleOutboundRequest(
+      request,
+      registry,
+      slackRuntime,
+      env,
+      wsGateway,
+      outputChannel,
+      recentlyDeliveredSlackTs,
+      logger,
+      slackIconsBaseUrl,
+    ),
     onReadSlack: async (request) => handleReadSlackHistory(slackRuntime, env, request),
     onRename: async (request) => handleRenameRequest(request, registry, terminals, wsGateway),
   });
@@ -557,7 +674,17 @@ export async function bootstrap(context: vscode.ExtensionContext): Promise<Agent
     registry,
     logger,
     iconsBaseUrl: localIconsBaseUrl,
-    onOutbound: async (request) => handleOutboundRequest(request, registry, slackRuntime, env, slackIconsBaseUrl),
+    onOutbound: async (request) => handleOutboundRequest(
+      request,
+      registry,
+      slackRuntime,
+      env,
+      wsGateway,
+      outputChannel,
+      recentlyDeliveredSlackTs,
+      logger,
+      slackIconsBaseUrl,
+    ),
     onAgentConnected: async (agent) => announceAgentOnline(slackRuntime, env, agent, slackIconsBaseUrl),
   });
 
@@ -565,7 +692,14 @@ export async function bootstrap(context: vscode.ExtensionContext): Promise<Agent
     env,
     logger,
     onAppMention: async (event) => handleHumanAppMention(event, registry, terminals, slackRuntime, env, outputChannel),
-    onChannelMessage: async (event) => handleInboundAgentMessage(event, registry, wsGateway, outputChannel),
+    onChannelMessage: async (event) => handleInboundAgentMessage(
+      event,
+      registry,
+      wsGateway,
+      outputChannel,
+      recentlyDeliveredSlackTs,
+      logger,
+    ),
   });
 
   await httpGateway.start();

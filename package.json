@@ -2,7 +2,7 @@
   "name": "agent-comms-vscode",
   "displayName": "Agent Orchestration",
   "description": "Coordinate Claude Code and OpenAI Codex agents via Slack from any VS Code workspace through a user-installed hub.",
-  "version": "0.2.19",
+  "version": "0.2.20",
   "publisher": "override-agency",
   "private": false,
   "engines": {
