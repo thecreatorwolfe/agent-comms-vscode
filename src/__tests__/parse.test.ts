@@ -40,9 +40,24 @@ Here is the schema.`);
     expect(result.message.taskId).toBe('bosa-phase0');
   });
 
+  it('routes inline @recipient aliases from a protocol body', () => {
+    const result = parseAgentSlackEventText(`[security-audit-codex-1→NICK]
+
+@alfred-2 please review the frontend branch.`);
+
+    expect(result.route).toBe('agent_header');
+    if (result.route !== 'agent_header') {
+      throw new Error('unexpected route');
+    }
+
+    expect(result.message.recipients).toEqual(['NICK', 'alfred-2']);
+  });
+
   it('flags malformed agent protocol posts instead of routing them', () => {
-    const result = parseAgentSlackEventText(`[security-audit-codex-1→security-audit-alfred-1]
-not valid`);
+    const result = parseAgentSlackEventText(`[security-audit-codex-1→security-audit-alfred-1] TASK:not valid
+SUBJECT: broken
+
+Body`);
 
     expect(result.route).toBe('invalid_protocol');
   });

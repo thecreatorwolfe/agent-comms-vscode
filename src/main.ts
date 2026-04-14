@@ -15,7 +15,7 @@ import { SpawnedTerminalRegistry } from './registry/terminals';
 import { GatewayHttpServer } from './gateway/http';
 import { WsGateway } from './gateway/ws';
 import { PROJECT_OVERRIDE_KEY, resolveProjectName } from './persona/project';
-import { parseAutomaticPersona } from './persona/naming';
+import { parseAutomaticPersona, resolveRecipientAlias } from './persona/naming';
 import { resolveIconUrl } from './persona/icons';
 import { validateSlackMessageText } from './schema/validate';
 import { spawnAgent, type SpawnRequest, type SpawnResult } from './spawn';
@@ -27,6 +27,14 @@ type OutboundRequest = {
   task_id: string;
   body: string;
   client_msg_id: string;
+};
+
+type RenameRequest = {
+  persona: string;
+  project_name?: string | null;
+  custom_name?: string | null;
+  persona_suffix?: string | null;
+  instance_number?: number | null;
 };
 
 type RouteErrorReason = 'schema_invalid' | 'unknown_recipient' | 'slack_api_error';
@@ -112,15 +120,21 @@ class AgentCommsRuntimeImpl implements AgentCommsRuntime {
       return;
     }
 
-    const customName = await vscode.window.showInputBox({
-      prompt: 'Optional custom persona name',
-      placeHolder: 'Leave blank for automatic numbering',
+    const projectName = await vscode.window.showInputBox({
+      prompt: 'Optional task/project name override',
+      placeHolder: 'Leave blank to use the workspace project name',
+    });
+
+    const personaSuffix = await vscode.window.showInputBox({
+      prompt: 'Optional persona suffix override',
+      placeHolder: 'Examples: alfred-30, codex-12, design-lead',
     });
 
     await this.spawn({
       kind: kind.value,
       briefFilePath: briefSelection[0].fsPath,
-      customName: customName?.trim() || undefined,
+      projectName: projectName?.trim() || undefined,
+      personaSuffix: personaSuffix?.trim() || undefined,
       parentPersona: null,
       taskId,
       reuseIdle: null,
@@ -252,12 +266,16 @@ function buildHumanControlAck(
   return `${affectedLine}${untrackedLine}`;
 }
 
+function resolveLiveRecipient(recipient: string, livePersonas: string[]): string | null {
+  return resolveRecipientAlias(recipient, livePersonas);
+}
+
 function resolveEventTargets(
   registry: AgentRegistry,
   recipients: string[],
   fromPersona: string,
 ): { targets: string[]; unknownRecipients: string[] } {
-  const livePersonas = new Set(registry.list().map((agent) => agent.persona));
+  const livePersonas = registry.list().map((agent) => agent.persona);
   const targets = new Set<string>();
   const unknownRecipients: string[] = [];
 
@@ -275,9 +293,10 @@ function resolveEventTargets(
       continue;
     }
 
-    if (livePersonas.has(recipient)) {
-      if (recipient !== fromPersona) {
-        targets.add(recipient);
+    const resolvedRecipient = resolveLiveRecipient(recipient, livePersonas);
+    if (resolvedRecipient) {
+      if (resolvedRecipient !== fromPersona) {
+        targets.add(resolvedRecipient);
       }
     } else {
       unknownRecipients.push(recipient);
@@ -373,14 +392,18 @@ async function handleOutboundRequest(
     });
   }
 
-  const livePersonas = new Set(registry.list().map((agent) => agent.persona));
-  const unknownRecipients = parsedBody.recipients.filter(
-    (recipient) => recipient !== 'ALL' && recipient !== 'NICK' && !livePersonas.has(recipient),
-  );
+  const livePersonas = registry.list().map((agent) => agent.persona);
+  const unknownRecipients = parsedBody.recipients.filter((recipient) => {
+    if (recipient === 'ALL' || recipient === 'NICK') {
+      return false;
+    }
+
+    return resolveLiveRecipient(recipient, livePersonas) === null;
+  });
   if (unknownRecipients.length > 0) {
     throw createRouteError('unknown_recipient', 'Outbound message includes unknown recipients', {
       unknownRecipients,
-      knownPersonas: [...livePersonas],
+      knownPersonas: livePersonas,
     });
   }
 
@@ -400,6 +423,82 @@ async function handleOutboundRequest(
     iconsBaseUrl: slackIconsBaseUrl,
     iconUrl: slackIconsBaseUrl ? undefined : null,
   });
+}
+
+async function handleReadSlackHistory(
+  slack: ReturnType<typeof createSlackBoltRuntime>,
+  env: ReturnType<typeof loadAgentCommsEnv>,
+  request: { thread_ts?: string | null; limit: number },
+): Promise<{
+  channel: string;
+  messages: Array<{
+    ts: string;
+    thread_ts?: string | null;
+    user?: string;
+    bot_id?: string;
+    text: string;
+  }>;
+}> {
+  const response = request.thread_ts
+    ? await slack.client.conversations.replies({
+      channel: env.SLACK_CHANNEL_ID,
+      ts: request.thread_ts,
+      limit: request.limit,
+    })
+    : await slack.client.conversations.history({
+      channel: env.SLACK_CHANNEL_ID,
+      limit: request.limit,
+    });
+
+  if (!response.ok) {
+    throw createRouteError('slack_api_error', 'Slack history read failed', response.error);
+  }
+
+  const rawMessages = Array.isArray(response.messages) ? response.messages : [];
+  const messages = rawMessages
+    .filter((message): message is typeof message & { text: string; ts: string } => (
+      typeof message === 'object' &&
+      message !== null &&
+      'text' in message &&
+      typeof message.text === 'string' &&
+      'ts' in message &&
+      typeof message.ts === 'string'
+    ))
+    .map((message) => ({
+      ts: message.ts,
+      thread_ts: 'thread_ts' in message && typeof message.thread_ts === 'string' ? message.thread_ts : null,
+      user: 'user' in message && typeof message.user === 'string' ? message.user : undefined,
+      bot_id: 'bot_id' in message && typeof message.bot_id === 'string' ? message.bot_id : undefined,
+      text: message.text,
+    }))
+    .sort((left, right) => Number(left.ts) - Number(right.ts));
+
+  return {
+    channel: env.SLACK_CHANNEL_ID,
+    messages,
+  };
+}
+
+async function handleRenameRequest(
+  request: RenameRequest,
+  registry: AgentRegistry,
+  terminals: SpawnedTerminalRegistry,
+  wsGateway: WsGateway,
+): Promise<{ persona: string; previous_persona: string }> {
+  const renamed = registry.rename({
+    persona: request.persona,
+    projectName: request.project_name ?? null,
+    customName: request.custom_name ?? null,
+    personaSuffix: request.persona_suffix ?? null,
+    instanceNumber: request.instance_number ?? null,
+  });
+
+  terminals.renamePersona(renamed.previousPersona, renamed.agent.persona);
+  wsGateway.renameSessionPersona(renamed.agent.socket, renamed.previousPersona, renamed.agent.persona);
+  return {
+    persona: renamed.agent.persona,
+    previous_persona: renamed.previousPersona,
+  };
 }
 
 export async function bootstrap(context: vscode.ExtensionContext): Promise<AgentCommsRuntime> {
@@ -427,6 +526,8 @@ export async function bootstrap(context: vscode.ExtensionContext): Promise<Agent
       terminals.untrackTerminal(terminal);
     }),
   );
+  let slackRuntime!: ReturnType<typeof createSlackBoltRuntime>;
+  let wsGateway!: WsGateway;
   const httpGateway = new GatewayHttpServer({
     port: env.EXTENSION_PORT,
     routerSharedSecret: env.ROUTER_SHARED_SECRET,
@@ -446,9 +547,11 @@ export async function bootstrap(context: vscode.ExtensionContext): Promise<Agent
         logger,
       }),
     onOutbound: async (request) => handleOutboundRequest(request, registry, slackRuntime, env, slackIconsBaseUrl),
+    onReadSlack: async (request) => handleReadSlackHistory(slackRuntime, env, request),
+    onRename: async (request) => handleRenameRequest(request, registry, terminals, wsGateway),
   });
 
-  const wsGateway = new WsGateway({
+  wsGateway = new WsGateway({
     server: httpGateway.server,
     routerSharedSecret: env.ROUTER_SHARED_SECRET,
     registry,
@@ -458,7 +561,7 @@ export async function bootstrap(context: vscode.ExtensionContext): Promise<Agent
     onAgentConnected: async (agent) => announceAgentOnline(slackRuntime, env, agent, slackIconsBaseUrl),
   });
 
-  const slackRuntime = createSlackBoltRuntime({
+  slackRuntime = createSlackBoltRuntime({
     env,
     logger,
     onAppMention: async (event) => handleHumanAppMention(event, registry, terminals, slackRuntime, env, outputChannel),

@@ -1,5 +1,41 @@
 # Changelog
 
+## 0.2.19
+
+- Fixed live agent renames so the hub updates the active WebSocket session persona immediately instead of waiting for heartbeat timeout and reconnect
+- Added a defensive MCP-side fallback that forces an immediate reconnect if the hub ever returns `persona_mismatch`
+
+## 0.2.18
+
+- Added `agent_comms_status` to Claude and Codex so agents can read their own live registry entry and confirm whether they are active or idle
+- Added real `standby.ack` and `resume.ack` frames so `agent_comms_standby` and `agent_comms_resume` return verified hub state instead of blind local success strings
+
+## 0.2.17
+
+- Added `~/.agent-comms/bin/claude-agent-comms`, a manual Claude launcher that opts into Agent Comms channel delivery for non-spawned sessions
+- Switched Claude spawns to use the installed `claude-agent-comms` wrapper so spawned and manual Claude sessions share the same channel-enabled launch path
+- Documented that plain `claude` sessions can load tools while still missing inbound Agent Comms pings if channel opt-in was not enabled at startup
+- Relaxed short recipient alias resolution so `codex2` / `codex-2`-style personas can still be targeted reliably
+- Fixed the manual Claude wrapper to use only `--dangerously-load-development-channels server:agent-comms`; `--channels` is for `plugin:...` entries, not local `server:...` development channels
+
+## 0.2.16
+
+- Fixed peer delivery for protocol messages that address recipients inline as `@alfred-2`, `@codex-3`, or `@design-lead` inside the body
+- Relaxed Slack relay filtering so Agent Comms accepts messages from its own bot user even when Slack omits `bot_id`/`bot_message`, which improves thread-reply delivery
+
+## 0.2.15
+
+- Added live `agent_comms_rename` tools for Claude and Codex so running agents can change their project/task segment and persona name without restart
+- Added structured spawn naming so new agents can override the project/task name plus persona suffix or exact runtime number
+- Normalized `@alfred-2` and similar recipient aliases so routing works without literal Slack user mentions
+- Regenerated the icon pack with stronger per-number hue differences so Codex/Claude variants are easier to distinguish in Slack
+
+## 0.2.14
+
+- Added compact Agent Comms messages so agents can send `[from→to]` plus a body without mandatory task, UTC, and subject lines
+- Added recipient alias resolution so messages can target `alfred-2`, `claude-2`, or `codex-1` without the full project-prefixed persona
+- Added `agent_comms_read_slack` to both Claude and Codex so agents can read recent Slack channel or thread history through the local hub
+
 ## 0.2.13
 
 - Regenerated the Codex and Claude icon pack from the provided OpenAI and Anthropic source logos

@@ -98,9 +98,6 @@ export function createSlackBoltRuntime(options: CreateSlackBoltRuntimeOptions): 
 
     const subtype = 'subtype' in event ? event.subtype : undefined;
     const botId = 'bot_id' in event ? event.bot_id : undefined;
-    if (subtype !== 'bot_message' && !botId) {
-      return;
-    }
     const normalizedEvent = {
       user: 'user' in event ? event.user : undefined,
       bot_id: botId,
@@ -110,6 +107,13 @@ export function createSlackBoltRuntime(options: CreateSlackBoltRuntimeOptions): 
       ts: event.ts,
       thread_ts: 'thread_ts' in event ? event.thread_ts : undefined,
     };
+    const isBotStyleEvent = subtype === 'bot_message'
+      || Boolean(normalizedEvent.bot_id)
+      || Boolean(normalizedEvent.user && identity?.botUserId && normalizedEvent.user === identity.botUserId);
+    if (!isBotStyleEvent) {
+      return;
+    }
+
     if (!isTrustedAgentRelayEvent(normalizedEvent, identity)) {
       options.logger?.warn(
         {

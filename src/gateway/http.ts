@@ -13,6 +13,9 @@ const spawnRequestSchema = z.object({
   kind: z.enum(['claude', 'codex']),
   brief_file_path: z.string().min(1),
   custom_name: z.string().min(1).nullable().optional(),
+  project_name: z.string().min(1).nullable().optional(),
+  persona_suffix: z.string().min(1).nullable().optional(),
+  instance_number: z.number().int().min(1).nullable().optional(),
   parent_persona: z.string().min(1).nullable().optional(),
   task_id: taskIdSchema,
   reuse_idle: z.boolean().nullable().optional(),
@@ -26,6 +29,19 @@ const outboundOneshotSchema = z.object({
   client_msg_id: z.string().uuid(),
 });
 
+const slackHistoryRequestSchema = z.object({
+  thread_ts: z.string().min(1).nullable().optional(),
+  limit: z.number().int().min(1).max(50).default(20),
+});
+
+const renameRequestSchema = z.object({
+  persona: z.string().min(1),
+  custom_name: z.string().min(1).nullable().optional(),
+  project_name: z.string().min(1).nullable().optional(),
+  persona_suffix: z.string().min(1).nullable().optional(),
+  instance_number: z.number().int().min(1).nullable().optional(),
+});
+
 export interface GatewayHttpServerOptions {
   port: number;
   routerSharedSecret: string;
@@ -34,6 +50,20 @@ export interface GatewayHttpServerOptions {
   logger?: Logger;
   onSpawn: (request: SpawnRequest) => Promise<SpawnResult>;
   onOutbound: (request: z.infer<typeof outboundOneshotSchema>) => Promise<PostedSlackMessage>;
+  onReadSlack: (request: z.infer<typeof slackHistoryRequestSchema>) => Promise<{
+    channel: string;
+    messages: Array<{
+      ts: string;
+      thread_ts?: string | null;
+      user?: string;
+      bot_id?: string;
+      text: string;
+    }>;
+  }>;
+  onRename: (request: z.infer<typeof renameRequestSchema>) => Promise<{
+    persona: string;
+    previous_persona: string;
+  }>;
 }
 
 function normalizeRouteError(error: unknown): { status: number; body: unknown } {
@@ -53,6 +83,9 @@ function normalizeRouteError(error: unknown): { status: number; body: unknown } 
     }
     if (error.name === 'SpawnPreconditionError') {
       return { status: 412, body: { error: error.message } };
+    }
+    if (/Persona collision/i.test(error.message)) {
+      return { status: 409, body: { error: error.message } };
     }
     return { status: 500, body: { error: error.message } };
   }
@@ -91,6 +124,9 @@ export class GatewayHttpServer {
           kind: parsed.data.kind,
           briefFilePath: parsed.data.brief_file_path,
           customName: parsed.data.custom_name ?? undefined,
+          projectName: parsed.data.project_name ?? undefined,
+          personaSuffix: parsed.data.persona_suffix ?? undefined,
+          instanceNumber: parsed.data.instance_number ?? undefined,
           parentPersona: parsed.data.parent_persona ?? null,
           taskId: parsed.data.task_id,
           reuseIdle: parsed.data.reuse_idle ?? null,
@@ -98,6 +134,23 @@ export class GatewayHttpServer {
         response.json(result);
       } catch (error) {
         this.options.logger?.error({ err: error }, 'spawn request failed');
+        const normalized = normalizeRouteError(error);
+        response.status(normalized.status).json(normalized.body);
+      }
+    });
+
+    this.app.post('/rename', requireSecret, async (request, response) => {
+      const parsed = renameRequestSchema.safeParse(request.body);
+      if (!parsed.success) {
+        response.status(400).json({ error: parsed.error.message });
+        return;
+      }
+
+      try {
+        const result = await this.options.onRename(parsed.data);
+        response.json(result);
+      } catch (error) {
+        this.options.logger?.error({ err: error }, 'rename request failed');
         const normalized = normalizeRouteError(error);
         response.status(normalized.status).json(normalized.body);
       }
@@ -130,6 +183,23 @@ export class GatewayHttpServer {
           connected_at: new Date(agent.connectedAt).toISOString(),
         })),
       });
+    });
+
+    this.app.post('/slack-history', requireSecret, async (request, response) => {
+      const parsed = slackHistoryRequestSchema.safeParse(request.body);
+      if (!parsed.success) {
+        response.status(400).json({ error: parsed.error.message });
+        return;
+      }
+
+      try {
+        const result = await this.options.onReadSlack(parsed.data);
+        response.json(result);
+      } catch (error) {
+        this.options.logger?.error({ err: error }, 'slack history request failed');
+        const normalized = normalizeRouteError(error);
+        response.status(normalized.status).json(normalized.body);
+      }
     });
   }
 

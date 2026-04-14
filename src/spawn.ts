@@ -10,12 +10,16 @@
 import * as vscode from 'vscode';
 import type { Logger } from 'pino';
 import { AgentRegistry } from './registry/agents';
+import { buildAutomaticPersona, buildProjectScopedPersona } from './persona/naming';
 import { resolveProjectName } from './persona/project';
 
 export interface SpawnRequest {
   kind: 'claude' | 'codex';
   briefFilePath: string;
   customName?: string;
+  projectName?: string;
+  personaSuffix?: string;
+  instanceNumber?: number;
   parentPersona?: string | null;
   taskId: string;
   reuseIdle?: boolean | null;
@@ -59,7 +63,7 @@ export function buildSpawnCommand(
 ): string {
   const quotedBrief = shellQuote(briefFilePath);
   if (kind === 'claude') {
-    return `claude --dangerously-load-development-channels server:agent-comms -n ${shellQuote(persona)} "$(cat ${quotedBrief})"`;
+    return `~/.agent-comms/bin/claude-agent-comms -n ${shellQuote(persona)} "$(cat ${quotedBrief})"`;
   }
 
   const chromeDevtoolsTimeoutArg = Number.isInteger(codexChromeDevtoolsStartupTimeoutSec)
@@ -89,7 +93,7 @@ export async function spawnAgent(req: SpawnRequest, dependencies: SpawnAgentDepe
 
   const project = resolveProjectName({
     cwd: dependencies.workspaceRoot,
-    override: dependencies.projectOverride,
+    override: req.projectName ?? dependencies.projectOverride,
   });
 
   let reuseIdle = req.reuseIdle ?? null;
@@ -119,9 +123,11 @@ export async function spawnAgent(req: SpawnRequest, dependencies: SpawnAgentDepe
       kind: req.kind,
       briefFilePath: req.briefFilePath,
       taskId: req.taskId,
-      customName: req.customName,
+      customName: resolveRequestedPersona(req, project),
+      personaSuffix: req.personaSuffix,
+      instanceNumber: req.instanceNumber,
       parentPersona: req.parentPersona ?? null,
-      projectOverride: dependencies.projectOverride,
+      projectOverride: req.projectName ?? dependencies.projectOverride,
     });
   } catch (error) {
     throw new SpawnConflictError(error instanceof Error ? error.message : String(error));
@@ -157,4 +163,20 @@ export async function spawnAgent(req: SpawnRequest, dependencies: SpawnAgentDepe
     terminalName: terminal.name,
     reused: false,
   };
+}
+
+function resolveRequestedPersona(req: SpawnRequest, project: string): string | undefined {
+  if (req.customName?.trim()) {
+    return req.customName.trim();
+  }
+
+  if (req.personaSuffix?.trim()) {
+    return buildProjectScopedPersona(project, req.personaSuffix);
+  }
+
+  if (req.instanceNumber != null) {
+    return buildAutomaticPersona(project, req.kind, req.instanceNumber);
+  }
+
+  return undefined;
 }

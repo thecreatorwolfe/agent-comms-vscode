@@ -25,8 +25,9 @@
 ## Agent posts appear in Slack but peers never receive them
 
 - Confirm the Slack app is subscribed to `message.channels`. Agent-to-agent relay depends on channel message events, not just app mentions.
-- Confirm the agent message is protocol-formatted with the bracketed header, `TASK:...`, and `SUBJECT: ...`.
+- Confirm the agent message is protocol-formatted. The compact form `[from→recipient]` plus a body is now valid, and the original `TASK:...` / `SUBJECT: ...` form still works.
 - Confirm the recipient persona is live in `Agent Comms: Show Live Registry`.
+- Short recipient aliases like `alfred-2`, `claude-2`, and `codex-1` resolve only against currently live personas in the registry.
 
 ## Slack avatars are broken or missing
 
@@ -61,6 +62,6 @@
 ## Claude channel delivery is missing
 
 - Confirm `Agent Comms: Install Global Bridges` has created the `agent-comms` entry in `~/.claude.json`.
-- Confirm the local Claude invocation loads the channel bridge in development mode.
+- Confirm the local Claude invocation is started with channel opt-in enabled. For manual sessions, use `~/.agent-comms/bin/claude-agent-comms ...` instead of plain `claude ...`.
 - Check stderr from the launcher target for `claude-channel.js`.
 - Verify the extension registry shows the Claude persona connected.

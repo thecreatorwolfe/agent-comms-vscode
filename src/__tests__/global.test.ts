@@ -1,6 +1,7 @@
 import { describe, expect, it } from 'vitest';
 import {
   DEFAULT_AGENT_COMMS_ENV_TEMPLATE,
+  getAgentCommsGlobalPaths,
   resolvePathTemplate,
   upsertClaudeConfigJson,
   upsertCodexConfigToml,
@@ -21,6 +22,11 @@ describe('global path helpers', () => {
         workspaceRoot: '/tmp/project',
       }),
     ).toBe('/tmp/project/ops/agent.env');
+  });
+
+  it('includes the manual Claude Agent Comms launcher path', () => {
+    expect(getAgentCommsGlobalPaths('/Users/tester').claudeCliWrapperPath)
+      .toBe('/Users/tester/.agent-comms/bin/claude-agent-comms');
   });
 });
 

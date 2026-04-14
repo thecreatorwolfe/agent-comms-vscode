@@ -14,6 +14,17 @@ export class SpawnedTerminalRegistry {
     return this.terminals.get(persona);
   }
 
+  renamePersona(previousPersona: string, nextPersona: string): boolean {
+    const terminal = this.terminals.get(previousPersona);
+    if (!terminal) {
+      return false;
+    }
+
+    this.terminals.delete(previousPersona);
+    this.terminals.set(nextPersona, terminal);
+    return true;
+  }
+
   untrackPersona(persona: string): void {
     this.terminals.delete(persona);
   }

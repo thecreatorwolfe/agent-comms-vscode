@@ -75,6 +75,20 @@ export const resumeFrameSchema = z.object({
   task_id: taskIdSchema.optional(),
 });
 
+export const standbyAckFrameSchema = z.object({
+  type: z.literal('standby.ack'),
+  persona: personaSchema,
+  task_id: taskIdSchema,
+  status: z.literal('idle'),
+});
+
+export const resumeAckFrameSchema = z.object({
+  type: z.literal('resume.ack'),
+  persona: personaSchema,
+  task_id: taskIdSchema.optional(),
+  status: z.literal('active'),
+});
+
 export const closeFrameSchema = z.object({
   type: z.literal('close'),
   persona: personaSchema,
@@ -113,6 +127,8 @@ export const extensionToPluginFrameSchema = z.discriminatedUnion('type', [
   heartbeatAckFrameSchema,
   outboundAckFrameSchema,
   outboundErrorFrameSchema,
+  standbyAckFrameSchema,
+  resumeAckFrameSchema,
   eventFrameSchema,
   genericErrorFrameSchema,
 ]);
@@ -128,6 +144,8 @@ export const anyFrameSchema = z.discriminatedUnion('type', [
   outboundErrorFrameSchema,
   standbyFrameSchema,
   resumeFrameSchema,
+  standbyAckFrameSchema,
+  resumeAckFrameSchema,
   closeFrameSchema,
   eventFrameSchema,
   genericErrorFrameSchema,
@@ -139,6 +157,8 @@ export type HeartbeatFrame = z.infer<typeof heartbeatFrameSchema>;
 export type OutboundFrame = z.infer<typeof outboundFrameSchema>;
 export type StandbyFrame = z.infer<typeof standbyFrameSchema>;
 export type ResumeFrame = z.infer<typeof resumeFrameSchema>;
+export type StandbyAckFrame = z.infer<typeof standbyAckFrameSchema>;
+export type ResumeAckFrame = z.infer<typeof resumeAckFrameSchema>;
 export type CloseFrame = z.infer<typeof closeFrameSchema>;
 export type EventFrame = z.infer<typeof eventFrameSchema>;
 export type PluginToExtensionFrame = z.infer<typeof pluginToExtensionFrameSchema>;

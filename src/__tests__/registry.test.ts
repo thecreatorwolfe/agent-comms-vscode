@@ -122,4 +122,32 @@ describe('AgentRegistry', () => {
 
     expect(replacement.persona).toBe('security-audit-codex-1');
   });
+
+  it('renames a live agent and preserves routing state', () => {
+    const registry = new AgentRegistry();
+    const reservation = registry.reserve({
+      cwd: '/tmp/security-audit',
+      kind: 'claude',
+      briefFilePath: '/tmp/brief.md',
+      taskId: 'frontend-pass',
+    }, 0);
+    registry.attach({
+      cwd: '/tmp/security-audit',
+      kind: 'claude',
+      pid: 8080,
+      socket: createSocket(),
+      persona: reservation.persona,
+    }, 0);
+
+    const renamed = registry.rename({
+      persona: reservation.persona,
+      projectName: 'checkout-flow',
+      instanceNumber: 30,
+    });
+
+    expect(renamed.previousPersona).toBe('security-audit-alfred-1');
+    expect(renamed.agent.persona).toBe('checkout-flow-alfred-30');
+    expect(registry.get('checkout-flow-alfred-30')?.pid).toBe(8080);
+    expect(registry.get('security-audit-alfred-1')).toBeUndefined();
+  });
 });

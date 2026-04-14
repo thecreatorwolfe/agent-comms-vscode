@@ -26,4 +26,17 @@ describe('SpawnedTerminalRegistry', () => {
     expect(registry.untrackTerminal(terminal)).toBe('security-audit-alfred-1');
     expect(registry.listTrackedPersonas()).toEqual([]);
   });
+
+  it('rekeys tracked terminals when a persona is renamed', () => {
+    const registry = new SpawnedTerminalRegistry();
+    const terminal = {
+      name: 'security-audit-codex-1',
+      dispose: vi.fn(),
+    };
+    registry.track('security-audit-codex-1', terminal);
+
+    expect(registry.renamePersona('security-audit-codex-1', 'checkout-flow-codex-30')).toBe(true);
+    expect(registry.get('checkout-flow-codex-30')).toBe(terminal);
+    expect(registry.get('security-audit-codex-1')).toBeUndefined();
+  });
 });

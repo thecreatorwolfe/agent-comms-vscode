@@ -45,6 +45,34 @@ STATUS: Written ✓ · Called ✗ · Deployed ✗ · Traced ✗`);
     expect(parsed.status?.called).toBe(false);
   });
 
+  it('parses the new compact protocol form with only header and body', () => {
+    const parsed = parseAgentSlackMessage(`[security-audit-codex-1→alfred-2]
+
+Need the frontend status update.`);
+
+    expect(parsed.from).toBe('security-audit-codex-1');
+    expect(parsed.recipients).toEqual(['alfred-2']);
+    expect(parsed.taskId).toBeUndefined();
+    expect(parsed.subject).toBeUndefined();
+    expect(parsed.body).toBe('Need the frontend status update.');
+  });
+
+  it('normalizes @-prefixed recipients inside the protocol header', () => {
+    const parsed = parseAgentSlackMessage(`[security-audit-codex-1→@alfred-2, @NICK]
+
+Need the frontend status update.`);
+
+    expect(parsed.recipients).toEqual(['alfred-2', 'NICK']);
+  });
+
+  it('merges inline @recipient aliases from the message body into routed recipients', () => {
+    const parsed = parseAgentSlackMessage(`[security-audit-codex-1→NICK]
+
+@alfred-2 can you validate the frontend handoff?`);
+
+    expect(parsed.recipients).toEqual(['NICK', 'alfred-2']);
+  });
+
   it('rejects malformed asks', () => {
     expect(() =>
       parseAgentSlackMessage(`[security-audit-codex-1→security-audit-alfred-1] TASK:bosa-phase0 | UTC:2026-04-14T00:30Z

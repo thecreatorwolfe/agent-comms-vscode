@@ -117,4 +117,102 @@ describe('AgentCommsWsClient waitForAuth', () => {
 
     await expect(pending).rejects.toThrow('schema_invalid');
   });
+
+  it('resolves sendStandbyAndWait once standby.ack arrives', async () => {
+    const client = new AgentCommsWsClient({
+      kind: 'codex',
+      port: 47592,
+      secret: 'secret',
+      cwd: '/tmp/project',
+    }) as AgentCommsWsClient & {
+      authenticated: boolean;
+      persona?: string;
+      ws: { readyState: number; send: ReturnType<typeof vi.fn> };
+      handleIncoming: (raw: string) => Promise<void>;
+    };
+
+    client.authenticated = true;
+    client.persona = 'demo-codex-1';
+    client.ws = { readyState: WebSocket.OPEN, send: vi.fn() };
+
+    const pending = client.sendStandbyAndWait('smoke-status', 1000);
+
+    await client.handleIncoming(
+      JSON.stringify({
+        type: 'standby.ack',
+        persona: 'demo-codex-1',
+        task_id: 'smoke-status',
+        status: 'idle',
+      }),
+    );
+
+    await expect(pending).resolves.toEqual({
+      persona: 'demo-codex-1',
+      taskId: 'smoke-status',
+      status: 'idle',
+    });
+  });
+
+  it('resolves sendResumeAndWait once resume.ack arrives', async () => {
+    const client = new AgentCommsWsClient({
+      kind: 'codex',
+      port: 47592,
+      secret: 'secret',
+      cwd: '/tmp/project',
+    }) as AgentCommsWsClient & {
+      authenticated: boolean;
+      persona?: string;
+      ws: { readyState: number; send: ReturnType<typeof vi.fn> };
+      handleIncoming: (raw: string) => Promise<void>;
+    };
+
+    client.authenticated = true;
+    client.persona = 'demo-codex-1';
+    client.ws = { readyState: WebSocket.OPEN, send: vi.fn() };
+
+    const pending = client.sendResumeAndWait('smoke-status', 1000);
+
+    await client.handleIncoming(
+      JSON.stringify({
+        type: 'resume.ack',
+        persona: 'demo-codex-1',
+        task_id: 'smoke-status',
+        status: 'active',
+      }),
+    );
+
+    await expect(pending).resolves.toEqual({
+      persona: 'demo-codex-1',
+      taskId: 'smoke-status',
+      status: 'active',
+    });
+  });
+
+  it('forces a reconnect when the extension reports persona_mismatch', async () => {
+    const close = vi.fn();
+    const client = new AgentCommsWsClient({
+      kind: 'codex',
+      port: 47592,
+      secret: 'secret',
+      cwd: '/tmp/project',
+    }) as AgentCommsWsClient & {
+      authenticated: boolean;
+      persona?: string;
+      ws: { readyState: number; send: ReturnType<typeof vi.fn>; close: ReturnType<typeof vi.fn> };
+      handleIncoming: (raw: string) => Promise<void>;
+    };
+
+    client.authenticated = true;
+    client.persona = 'demo-codex-1';
+    client.ws = { readyState: WebSocket.OPEN, send: vi.fn(), close };
+
+    await client.handleIncoming(
+      JSON.stringify({
+        type: 'error',
+        reason: 'persona_mismatch',
+      }),
+    );
+
+    expect(close).toHaveBeenCalledWith(4009, 'persona_mismatch');
+  });
 });

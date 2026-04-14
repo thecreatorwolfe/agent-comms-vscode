@@ -58,6 +58,7 @@ export class WsGateway {
   private readonly wss = new WebSocketServer({ noServer: true });
   private readonly heartbeatMonitor: HeartbeatMonitor;
   private readonly options: WsGatewayOptions;
+  private readonly sessions = new WeakMap<WebSocket, WsSessionState>();
 
   constructor(options: WsGatewayOptions) {
     this.options = options;
@@ -108,6 +109,25 @@ export class WsGateway {
     return true;
   }
 
+  renameSessionPersona(socketLike: AgentRecord['socket'], previousPersona: string, nextPersona: string): boolean {
+    const socket = socketLike as WebSocket;
+    const session = this.sessions.get(socket);
+    if (!session) {
+      return false;
+    }
+
+    if (
+      session.persona !== undefined &&
+      session.persona !== previousPersona &&
+      session.persona !== nextPersona
+    ) {
+      return false;
+    }
+
+    session.persona = nextPersona;
+    return true;
+  }
+
   private readonly handleUpgrade = (request: http.IncomingMessage, socket: import('node:net').Socket, head: Buffer): void => {
     const pathname = new URL(request.url ?? '/', 'http://127.0.0.1').pathname;
     if (pathname !== '/ws') {
@@ -122,6 +142,7 @@ export class WsGateway {
 
   private async handleConnection(socket: WebSocket, _request: http.IncomingMessage): Promise<void> {
     const session: WsSessionState = {};
+    this.sessions.set(socket, session);
     const authTimeout = setTimeout(() => {
       sendFrame(socket, { type: 'auth.error', reason: 'malformed' });
       socket.close(4401, 'auth_timeout');
@@ -200,6 +221,7 @@ export class WsGateway {
       if (session.persona) {
         this.options.registry.markSocketClosed(session.persona);
       }
+      this.sessions.delete(socket);
     });
   }
 
@@ -240,12 +262,24 @@ export class WsGateway {
       }
       case 'standby': {
         const standby = standbyFrameSchema.parse(frame);
-        this.options.registry.markStandby(standby.persona, standby.task_id);
+        const agent = this.options.registry.markStandby(standby.persona, standby.task_id);
+        sendFrame(socket, {
+          type: 'standby.ack',
+          persona: agent.persona,
+          task_id: agent.taskId,
+          status: agent.status,
+        });
         return;
       }
       case 'resume': {
         const resume = resumeFrameSchema.parse(frame);
-        this.options.registry.markResume(resume.persona, resume.task_id);
+        const agent = this.options.registry.markResume(resume.persona, resume.task_id);
+        sendFrame(socket, {
+          type: 'resume.ack',
+          persona: agent.persona,
+          task_id: agent.taskId,
+          status: agent.status,
+        });
         return;
       }
       case 'close': {

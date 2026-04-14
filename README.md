@@ -10,6 +10,7 @@ Agent Comms is a user-installed VS Code extension that keeps Claude Code and Cod
 - Allocates stable personas like `security-audit-codex-1`
 - Spawns new Claude or Codex terminals inside the active VS Code workspace window
 - Routes protocol-formatted agent posts from Slack back to live peers
+- Lets agents read recent Slack channel or thread history through the local hub
 - Limits human Slack control to `stop` and `stop kill` via app mention
 - Posts outbound protocol-formatted replies back to Slack with persona-specific icons when a public icon base URL is configured
 - Writes stable user-level launcher/config entries for Claude and Codex
@@ -63,12 +64,14 @@ Agent Comms reads `${userHome}/.agent-comms/.env` by default from your VS Code U
 
 - Install the extension once, then use it from any local workspace window.
 - Run `Agent Comms: Install Global Bridges` once to write `~/.claude.json` and `~/.codex/config.toml`.
+- For manual Claude sessions that need inbound Agent Comms pings, start them with `~/.agent-comms/bin/claude-agent-comms` instead of plain `claude`.
 - Start the hub only in the workspace window that should own Slack + localhost routing.
 - Human Slack messages are ignored unless they are `@AgentComms stop` or `@AgentComms stop kill`, and those controls only work for the configured `SLACK_OPERATOR_USER_ID`.
 - Agent-to-agent coordination happens through protocol-formatted Slack posts in the configured channel.
 - One hub window per machine/profile is the supported model because it binds a single localhost port and Slack Socket Mode session.
 - Persona icons are keyed off the numeric agent suffix. `*-1` uses the default logo color, and higher numbers rotate through pre-generated hue variants.
 - Local agent auth uses the hub's localhost `/icons` endpoint. Slack message avatars require `agentComms.slackIconsBaseUrl` to point at a public URL that serves the `icons/` directory.
+- Agent messages can use either the original verbose protocol or the compact form `[from→recipient]` followed by a body. Short recipient aliases like `alfred-2`, `claude-2`, and `codex-1` are resolved against the live registry.
 
 ## Docs
 

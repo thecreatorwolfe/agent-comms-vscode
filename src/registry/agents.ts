@@ -1,6 +1,11 @@
 import type { Logger } from 'pino';
 import { PersonaAllocator, type PersonaAllocation } from './allocator';
-import type { AgentKind } from '../persona/naming';
+import {
+  buildAutomaticPersona,
+  buildProjectScopedPersona,
+  extractPersonaSuffix,
+  type AgentKind,
+} from '../persona/naming';
 import { resolveProjectName } from '../persona/project';
 
 export interface AgentSocketLike {
@@ -36,6 +41,8 @@ export interface ReserveAgentParams {
   briefFilePath: string;
   taskId: string;
   customName?: string | null;
+  personaSuffix?: string | null;
+  instanceNumber?: number | null;
   parentPersona?: string | null;
   projectOverride?: string | null;
 }
@@ -56,6 +63,14 @@ export interface AgentRegistryOptions {
   logger?: Logger;
 }
 
+export interface RenameAgentParams {
+  persona: string;
+  projectName?: string | null;
+  customName?: string | null;
+  personaSuffix?: string | null;
+  instanceNumber?: number | null;
+}
+
 export class AgentRegistry {
   private readonly allocator: PersonaAllocator;
   private readonly reservationTtlMs: number;
@@ -73,7 +88,11 @@ export class AgentRegistry {
 
   reserve(params: ReserveAgentParams, now = Date.now()): ReservationRecord {
     const project = resolveProjectName({ cwd: params.cwd, override: params.projectOverride });
-    const allocation = this.allocator.reserve(project, params.kind, params.customName);
+    const allocation = this.allocator.reserve(project, params.kind, {
+      customName: params.customName,
+      personaSuffix: params.personaSuffix,
+      instanceNumber: params.instanceNumber,
+    });
     const reservation: ReservationRecord = {
       ...allocation,
       createdAt: now,
@@ -170,6 +189,34 @@ export class AgentRegistry {
     );
   }
 
+  rename(params: RenameAgentParams): { previousPersona: string; agent: AgentRecord } {
+    const agent = this.requireAgent(params.persona);
+    if (params.customName && (params.projectName || params.personaSuffix || params.instanceNumber != null)) {
+      throw new Error('customName cannot be combined with projectName, personaSuffix, or instanceNumber');
+    }
+    if (params.personaSuffix && params.instanceNumber != null) {
+      throw new Error('personaSuffix and instanceNumber cannot be combined');
+    }
+
+    const nextProject = params.projectName?.trim() ? resolveProjectName({ cwd: agent.cwd, override: params.projectName }) : agent.project;
+    const nextPersona = this.resolveRenamedPersona(agent, nextProject, params);
+    if (nextPersona === agent.persona && nextProject === agent.project) {
+      return { previousPersona: agent.persona, agent };
+    }
+
+    const allocation = this.allocator.reserve(nextProject, agent.kind, { customName: nextPersona });
+    const previousPersona = agent.persona;
+    this.agents.delete(previousPersona);
+    this.allocator.release(agent);
+
+    const renamed: AgentRecord = {
+      ...agent,
+      ...allocation,
+    };
+    this.agents.set(renamed.persona, renamed);
+    return { previousPersona, agent: renamed };
+  }
+
   recordHeartbeat(persona: string, now = Date.now()): AgentRecord {
     const agent = this.requireAgent(persona);
     agent.lastHeartbeatAt = now;
@@ -246,5 +293,25 @@ export class AgentRegistry {
     }
 
     return agent;
+  }
+
+  private resolveRenamedPersona(
+    agent: AgentRecord,
+    project: string,
+    params: Omit<RenameAgentParams, 'persona'>,
+  ): string {
+    if (params.customName?.trim()) {
+      return params.customName.trim();
+    }
+
+    if (params.personaSuffix?.trim()) {
+      return buildProjectScopedPersona(project, params.personaSuffix);
+    }
+
+    if (params.instanceNumber != null) {
+      return buildAutomaticPersona(project, agent.kind, params.instanceNumber);
+    }
+
+    return buildProjectScopedPersona(project, extractPersonaSuffix(agent.persona, agent.project));
   }
 }

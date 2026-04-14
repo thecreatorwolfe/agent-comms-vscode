@@ -5,7 +5,14 @@ import { McpServer } from '@modelcontextprotocol/sdk/server/mcp.js';
 import { StdioServerTransport } from '@modelcontextprotocol/sdk/server/stdio.js';
 import type { AgentCommsLogLevel } from '../env';
 import { createLogger } from '../log';
-import { agentCommsReplyInputSchema, buildProtocolSlackMessage, normalizeRecipients } from './reply';
+import {
+  agentCommsReadSlackInputSchema,
+  agentCommsReplyInputSchema,
+  buildProtocolSlackMessage,
+  formatSlackHistoryTranscript,
+  normalizeRecipients,
+} from './reply';
+import { fetchSelfAgentStatus, formatAgentStatus } from './status';
 import { resolveBridgeEnv } from './runtime-env';
 import { AgentCommsWsClient } from './ws-client';
 
@@ -74,10 +81,13 @@ async function main(): Promise<void> {
         briefFilePath: z.string().min(1),
         taskId: z.string().min(1),
         customName: z.string().min(1).optional(),
+        projectName: z.string().min(1).optional(),
+        personaSuffix: z.string().min(1).optional(),
+        instanceNumber: z.number().int().min(1).optional(),
         reuseIdle: z.boolean().optional(),
       }),
     },
-    async ({ kind, briefFilePath, taskId, customName, reuseIdle }) => {
+    async ({ kind, briefFilePath, taskId, customName, projectName, personaSuffix, instanceNumber, reuseIdle }) => {
       await client.waitForAuth();
       const response = await fetch(`http://127.0.0.1:${port}/spawn`, {
         method: 'POST',
@@ -89,6 +99,9 @@ async function main(): Promise<void> {
           kind,
           brief_file_path: briefFilePath,
           custom_name: customName ?? null,
+          project_name: projectName ?? null,
+          persona_suffix: personaSuffix ?? null,
+          instance_number: instanceNumber ?? null,
           parent_persona: client.getCurrentPersona() ?? claimedPersona ?? null,
           task_id: taskId,
           reuse_idle: reuseIdle ?? null,
@@ -113,6 +126,128 @@ async function main(): Promise<void> {
           {
             type: 'text',
             text: `Spawn request accepted for ${payload.persona}${payload.reused ? ' (reused idle agent)' : ''}.`,
+          },
+        ],
+      };
+    },
+  );
+
+  server.registerTool(
+    'agent_comms_rename',
+    {
+      description: 'Rename this live agent without restarting. You can change the task/project segment, the persona suffix, or the full persona.',
+      inputSchema: z.object({
+        customName: z.string().min(1).optional(),
+        projectName: z.string().min(1).optional(),
+        personaSuffix: z.string().min(1).optional(),
+        instanceNumber: z.number().int().min(1).optional(),
+      }).refine(
+        (value) => (
+          value.customName !== undefined
+          || value.projectName !== undefined
+          || value.personaSuffix !== undefined
+          || value.instanceNumber !== undefined
+        ),
+        'Provide at least one rename field.',
+      ),
+    },
+    async ({ customName, projectName, personaSuffix, instanceNumber }) => {
+      const previousPersona = await client.waitForAuth();
+      const response = await fetch(`http://127.0.0.1:${port}/rename`, {
+        method: 'POST',
+        headers: {
+          'Content-Type': 'application/json',
+          'X-Router-Secret': secret,
+        },
+        body: JSON.stringify({
+          persona: previousPersona,
+          custom_name: customName ?? null,
+          project_name: projectName ?? null,
+          persona_suffix: personaSuffix ?? null,
+          instance_number: instanceNumber ?? null,
+        }),
+      });
+
+      const payload = await response.json() as {
+        persona?: string;
+        previous_persona?: string;
+        error?: string;
+      };
+      if (!response.ok) {
+        throw new Error(
+          typeof payload.error === 'string'
+            ? payload.error
+            : `Rename request failed with HTTP ${response.status}`,
+        );
+      }
+
+      if (!payload.persona) {
+        throw new Error('Rename request did not return a persona');
+      }
+
+      client.setCurrentPersona(payload.persona);
+      return {
+        content: [
+          {
+            type: 'text',
+            text: `Renamed ${payload.previous_persona ?? previousPersona} to ${payload.persona}.`,
+          },
+        ],
+      };
+    },
+  );
+
+  server.registerTool(
+    'agent_comms_read_slack',
+    {
+      description: 'Read recent messages from the configured Agent Comms Slack channel or a specific Slack thread.',
+      inputSchema: agentCommsReadSlackInputSchema,
+    },
+    async ({ limit, threadTs }) => {
+      await client.waitForAuth();
+      const response = await fetch(`http://127.0.0.1:${port}/slack-history`, {
+        method: 'POST',
+        headers: {
+          'Content-Type': 'application/json',
+          'X-Router-Secret': secret,
+        },
+        body: JSON.stringify({
+          thread_ts: threadTs ?? null,
+          limit: limit ?? 20,
+        }),
+      });
+
+      const payload = await response.json() as {
+        messages?: Array<{
+          ts: string;
+          thread_ts?: string | null;
+          user?: string;
+          bot_id?: string;
+          text: string;
+        }>;
+        error?: string;
+      };
+      if (!response.ok) {
+        throw new Error(
+          typeof payload.error === 'string'
+            ? payload.error
+            : `Slack history request failed with HTTP ${response.status}`,
+        );
+      }
+
+      return {
+        content: [
+          {
+            type: 'text',
+            text: formatSlackHistoryTranscript(
+              (payload.messages ?? []).map((message) => ({
+                ts: message.ts,
+                threadTs: message.thread_ts ?? null,
+                user: message.user,
+                botId: message.bot_id,
+                text: message.text,
+              })),
+            ),
           },
         ],
       };
@@ -153,6 +288,26 @@ async function main(): Promise<void> {
   );
 
   server.registerTool(
+    'agent_comms_status',
+    {
+      description: 'Read the live Agent Comms registry entry for this Codex session so you can confirm whether you are active or idle.',
+      inputSchema: z.object({}),
+    },
+    async () => {
+      const persona = await client.waitForAuth();
+      const status = await fetchSelfAgentStatus({
+        port,
+        secret,
+        persona,
+      });
+
+      return {
+        content: [{ type: 'text', text: formatAgentStatus(status) }],
+      };
+    },
+  );
+
+  server.registerTool(
     'agent_comms_standby',
     {
       description: 'Mark this Codex agent idle but still reachable for future Slack messages.',
@@ -162,9 +317,9 @@ async function main(): Promise<void> {
     },
     async ({ taskId }) => {
       await client.waitForAuth();
-      client.sendStandby(taskId);
+      const status = await client.sendStandbyAndWait(taskId);
       return {
-        content: [{ type: 'text', text: `Marked agent standby for task ${taskId}.` }],
+        content: [{ type: 'text', text: `Marked ${status.persona} standby for task ${status.taskId}. Status: ${status.status}.` }],
       };
     },
   );
@@ -179,9 +334,9 @@ async function main(): Promise<void> {
     },
     async ({ taskId }) => {
       await client.waitForAuth();
-      client.sendResume(taskId);
+      const status = await client.sendResumeAndWait(taskId);
       return {
-        content: [{ type: 'text', text: `Marked agent active${taskId ? ` for ${taskId}` : ''}.` }],
+        content: [{ type: 'text', text: `Marked ${status.persona} active${status.taskId ? ` for ${status.taskId}` : ''}. Status: ${status.status}.` }],
       };
     },
   );

@@ -54,6 +54,7 @@
    - `~/.claude.json` with an `agent-comms` MCP server entry
    - `~/.codex/config.toml` with an `[mcp_servers.agent-comms]` entry
    - stable launcher scripts under `~/.agent-comms/bin/`
+   - `~/.agent-comms/bin/claude-agent-comms`, a wrapper for manual Claude sessions that need inbound channel delivery
 
 7. Open the local repo you want to orchestrate, then run `Agent Comms: Start Hub In This Workspace`.
 
@@ -69,4 +70,5 @@
 - Those two controls only work when the app mention comes from `SLACK_OPERATOR_USER_ID`.
 - Normal human Slack instructions are ignored by the hub. Slack is for agent coordination and operator monitoring, not remote task steering.
 - Claude custom channels still require Anthropic's development-channel flag during the current research-preview period; the spawn command adds that automatically.
+- If you manually launch Claude outside `Agent Comms: Spawn Agent`, use `~/.agent-comms/bin/claude-agent-comms ...` rather than plain `claude ...` or inbound pings may never surface in-session.
 - If you want to tune the Codex MCP startup headroom, set `agentComms.codexChromeDevtoolsStartupTimeoutSec` in VS Code user settings.

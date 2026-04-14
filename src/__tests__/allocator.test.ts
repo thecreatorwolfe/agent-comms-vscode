@@ -25,7 +25,7 @@ describe('PersonaAllocator', () => {
 
   it('lets custom names skip numeric allocation', () => {
     const allocator = new PersonaAllocator();
-    const custom = allocator.reserve('security-audit', 'codex', 'audit-reviewer');
+    const custom = allocator.reserve('security-audit', 'codex', { customName: 'audit-reviewer' });
     const firstAuto = allocator.reserve('security-audit', 'codex');
 
     expect(custom.persona).toBe('audit-reviewer');
@@ -34,10 +34,20 @@ describe('PersonaAllocator', () => {
 
   it('rejects live custom-name collisions', () => {
     const allocator = new PersonaAllocator();
-    allocator.reserve('security-audit', 'codex', 'audit-reviewer');
+    allocator.reserve('security-audit', 'codex', { customName: 'audit-reviewer' });
 
-    expect(() => allocator.reserve('security-audit', 'claude', 'audit-reviewer')).toThrow(
+    expect(() => allocator.reserve('security-audit', 'claude', { customName: 'audit-reviewer' })).toThrow(
       /Persona collision/,
     );
+  });
+
+  it('supports explicit instance numbers and project-scoped persona suffixes', () => {
+    const allocator = new PersonaAllocator();
+    const renamed = allocator.reserve('checkout-flow', 'claude', { instanceNumber: 30 });
+    const suffix = allocator.reserve('checkout-flow', 'codex', { personaSuffix: 'design-lead' });
+
+    expect(renamed.persona).toBe('checkout-flow-alfred-30');
+    expect(renamed.instanceNumber).toBe(30);
+    expect(suffix.persona).toBe('checkout-flow-design-lead');
   });
 });

@@ -1,7 +1,7 @@
 import { z } from 'zod';
 import { personaSchema } from '../persona/naming';
 
-const routingTokenSchema = z.union([personaSchema, z.literal('ALL'), z.literal('NICK')]);
+const routingTokenSchema = z.string().regex(/^(?:ALL|NICK|[a-z0-9][a-z0-9-]{0,63})$/);
 const fromTokenSchema = z.union([personaSchema, z.literal('NICK')]);
 const isoTimestampSchema = z.string().refine((value) => !Number.isNaN(Date.parse(value)), {
   message: 'Invalid ISO 8601 timestamp',
@@ -24,10 +24,10 @@ export const slackStatusSchema = z.object({
 export const parsedSlackMessageSchema = z.object({
   from: fromTokenSchema,
   recipients: z.array(routingTokenSchema).min(1),
-  taskId: taskIdSchema,
-  utc: isoTimestampSchema,
-  subject: z.string().min(1).max(100),
-  body: z.string().max(3500),
+  taskId: taskIdSchema.optional(),
+  utc: isoTimestampSchema.optional(),
+  subject: z.string().min(1).max(100).optional(),
+  body: z.string().min(1).max(3500),
   asks: z.array(slackAskSchema),
   status: slackStatusSchema.optional(),
 });
@@ -42,8 +42,32 @@ const statusLinePattern =
 function parseRecipients(rawRecipients: string): string[] {
   return rawRecipients
     .split(',')
-    .map((recipient) => recipient.trim())
+    .map((recipient) => {
+      const normalized = recipient.trim().replace(/^@+/, '');
+      const upper = normalized.toUpperCase();
+      if (upper === 'ALL' || upper === 'NICK') {
+        return upper;
+      }
+
+      return normalized.toLowerCase();
+    })
     .filter(Boolean);
+}
+
+function extractInlineRecipients(text: string): string[] {
+  const matches = text.matchAll(/(?:^|[\s(])@(?<recipient>(?:ALL|NICK|[a-z0-9][a-z0-9-]{1,63}))(?=$|[\s,.:;!?)])/gimu);
+  const recipients = new Set<string>();
+  for (const match of matches) {
+    const raw = match.groups?.recipient;
+    if (!raw) {
+      continue;
+    }
+
+    const upper = raw.toUpperCase();
+    recipients.add(upper === 'ALL' || upper === 'NICK' ? upper : raw.toLowerCase());
+  }
+
+  return [...recipients];
 }
 
 function parseAsksBlock(block: string): SlackAsk[] {
@@ -81,16 +105,43 @@ function parseStatusLine(line: string): SlackStatus {
 
 export function parseAgentSlackMessage(text: string): ParsedSlackMessage {
   const normalized = text.replace(/\r\n/g, '\n').trim();
-  const headerMatch =
-    /^\[(?<from>[^→\]\n]+)→(?<recipients>[^\]\n]+)\] TASK:(?<taskId>[a-z0-9-]+) \| UTC:(?<utc>[^\n]+)\nSUBJECT: (?<subject>[^\n]{1,100})\n\n(?<rest>[\s\S]*)$/u.exec(
-      normalized,
-    );
+  const newlineIndex = normalized.indexOf('\n');
+  const headerLine = newlineIndex >= 0 ? normalized.slice(0, newlineIndex) : normalized;
+  const headerRest = newlineIndex >= 0 ? normalized.slice(newlineIndex + 1) : '';
+  const headerMatch = /^\[(?<from>[^→\]\n]+)→(?<recipients>[^\]\n]+)\](?: (?<metadata>[^\n]+))?$/u.exec(headerLine);
 
   if (!headerMatch?.groups) {
     throw new Error('Slack message does not match the protocol header');
   }
 
-  let remainder = headerMatch.groups.rest;
+  let taskId: string | undefined;
+  let utc: string | undefined;
+  if (headerMatch.groups.metadata) {
+    const metadataMatch = /^TASK:(?<taskId>[a-z0-9-]+) \| UTC:(?<utc>.+)$/u.exec(headerMatch.groups.metadata.trim());
+    if (!metadataMatch?.groups) {
+      throw new Error('Slack message has invalid protocol metadata');
+    }
+
+    taskId = metadataMatch.groups.taskId;
+    utc = metadataMatch.groups.utc.trim();
+  }
+
+  let remainder = headerRest;
+  let subject: string | undefined;
+  if (remainder.startsWith('SUBJECT: ')) {
+    const subjectNewline = remainder.indexOf('\n');
+    if (subjectNewline < 0) {
+      throw new Error('Slack message is missing a body after SUBJECT');
+    }
+
+    subject = remainder.slice('SUBJECT: '.length, subjectNewline).trim();
+    remainder = remainder.slice(subjectNewline + 1);
+  }
+
+  if (remainder.startsWith('\n')) {
+    remainder = remainder.slice(1);
+  }
+
   let status: SlackStatus | undefined;
 
   const statusIndex = remainder.lastIndexOf('\n\nSTATUS: ');
@@ -108,12 +159,17 @@ export function parseAgentSlackMessage(text: string): ParsedSlackMessage {
     asks = parseAsksBlock(remainder.slice(asksIndex + '\n\nASKS:\n'.length));
   }
 
+  const normalizedRecipients = [...new Set([
+    ...parseRecipients(headerMatch.groups.recipients),
+    ...extractInlineRecipients(remainder),
+  ])];
+
   return parsedSlackMessageSchema.parse({
     from: headerMatch.groups.from.trim(),
-    recipients: parseRecipients(headerMatch.groups.recipients),
-    taskId: headerMatch.groups.taskId,
-    utc: headerMatch.groups.utc.trim(),
-    subject: headerMatch.groups.subject.trim(),
+    recipients: normalizedRecipients,
+    taskId,
+    utc,
+    subject,
     body: body.trimEnd(),
     asks,
     status,

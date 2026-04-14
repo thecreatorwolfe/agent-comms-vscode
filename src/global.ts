@@ -19,6 +19,7 @@ export interface AgentCommsGlobalPaths {
   launchersDir: string;
   codexLauncherPath: string;
   claudeLauncherPath: string;
+  claudeCliWrapperPath: string;
   codexConfigPath: string;
   claudeConfigPath: string;
 }
@@ -67,6 +68,7 @@ export function getAgentCommsGlobalPaths(userHome = os.homedir()): AgentCommsGlo
     launchersDir,
     codexLauncherPath: path.join(launchersDir, 'codex-server.js'),
     claudeLauncherPath: path.join(launchersDir, 'claude-channel.js'),
+    claudeCliWrapperPath: path.join(launchersDir, 'claude-agent-comms'),
     codexConfigPath: path.join(userHome, '.codex', 'config.toml'),
     claudeConfigPath: path.join(userHome, '.claude.json'),
   };
@@ -74,6 +76,15 @@ export function getAgentCommsGlobalPaths(userHome = os.homedir()): AgentCommsGlo
 
 function buildLauncherSource(targetPath: string): string {
   return `#!/usr/bin/env node\nrequire(${JSON.stringify(targetPath)});\n`;
+}
+
+function buildClaudeCliWrapperSource(): string {
+  return [
+    '#!/usr/bin/env bash',
+    'set -euo pipefail',
+    'exec claude --dangerously-load-development-channels server:agent-comms "$@"',
+    '',
+  ].join('\n');
 }
 
 async function readTextIfExists(filePath: string): Promise<string | undefined> {
@@ -90,6 +101,12 @@ async function readTextIfExists(filePath: string): Promise<string | undefined> {
 async function writeLauncherFile(filePath: string, targetPath: string): Promise<void> {
   await fs.mkdir(path.dirname(filePath), { recursive: true });
   await fs.writeFile(filePath, buildLauncherSource(targetPath), 'utf8');
+  await fs.chmod(filePath, 0o755);
+}
+
+async function writeShellScript(filePath: string, source: string): Promise<void> {
+  await fs.mkdir(path.dirname(filePath), { recursive: true });
+  await fs.writeFile(filePath, source, 'utf8');
   await fs.chmod(filePath, 0o755);
 }
 
@@ -169,6 +186,7 @@ export async function ensureGlobalBridgeLaunchers(
   await fs.mkdir(paths.homeDir, { recursive: true });
   await writeLauncherFile(paths.codexLauncherPath, path.resolve(extensionPath, 'dist/mcp/codex-server.js'));
   await writeLauncherFile(paths.claudeLauncherPath, path.resolve(extensionPath, 'dist/mcp/claude-channel.js'));
+  await writeShellScript(paths.claudeCliWrapperPath, buildClaudeCliWrapperSource());
   return paths;
 }
 

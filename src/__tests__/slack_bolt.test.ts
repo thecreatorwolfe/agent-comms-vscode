@@ -28,6 +28,19 @@ describe('isTrustedAgentRelayEvent', () => {
     expect(isTrustedAgentRelayEvent(event, identity)).toBe(true);
   });
 
+  it('accepts a thread reply-style event when Slack only gives the bot user id', () => {
+    const event: SlackChannelMessageEvent = {
+      user: 'Ubot',
+      text: '[demo-codex-1→demo-alfred-1]\n\n@alfred-1 ping',
+      channel: 'C123',
+      ts: '1713081600.000100',
+      thread_ts: '1713081500.000001',
+    };
+    const identity: SlackRuntimeIdentity = { botUserId: 'Ubot' };
+
+    expect(isTrustedAgentRelayEvent(event, identity)).toBe(true);
+  });
+
   it('rejects a bot-style message from a different bot identity', () => {
     const event: SlackChannelMessageEvent = {
       user: 'Uother',

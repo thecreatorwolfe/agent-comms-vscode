@@ -15,7 +15,7 @@ describe('spawn command building', () => {
   it('does not add Codex MCP config overrides to Claude spawns', () => {
     const command = buildSpawnCommand('claude', 'demo-alfred-1', '/tmp/brief.md', 30);
 
-    expect(command).toContain('claude --dangerously-load-development-channels server:agent-comms');
+    expect(command).toContain('~/.agent-comms/bin/claude-agent-comms');
     expect(command).not.toContain('chrome-devtools.startup_timeout_sec');
   });
 });

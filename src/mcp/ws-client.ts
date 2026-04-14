@@ -33,6 +33,21 @@ export class AgentCommsWsClient {
       timeout: NodeJS.Timeout;
     }
   >();
+  private pendingStandby:
+    | {
+      taskId: string;
+      resolve: (result: { persona: string; taskId: string; status: 'idle' }) => void;
+      reject: (error: Error) => void;
+      timeout: NodeJS.Timeout;
+    }
+    | undefined;
+  private pendingResume:
+    | {
+      resolve: (result: { persona: string; taskId?: string; status: 'active' }) => void;
+      reject: (error: Error) => void;
+      timeout: NodeJS.Timeout;
+    }
+    | undefined;
   private stopped = false;
   private authenticated = false;
   private persona: string | undefined;
@@ -68,6 +83,10 @@ export class AgentCommsWsClient {
 
   getCurrentPersona(): string | undefined {
     return this.persona;
+  }
+
+  setCurrentPersona(persona: string): void {
+    this.persona = persona;
   }
 
   sendOutbound(frame: Omit<OutboundFrame, 'type' | 'persona'>): void {
@@ -125,6 +144,38 @@ export class AgentCommsWsClient {
     });
   }
 
+  async sendStandbyAndWait(
+    taskId: string,
+    timeoutMs = 5_000,
+  ): Promise<{ persona: string; taskId: string; status: 'idle' }> {
+    if (!this.persona) {
+      throw new Error('Cannot send standby before auth.ack');
+    }
+
+    return new Promise((resolve, reject) => {
+      const timeout = setTimeout(() => {
+        this.pendingStandby = undefined;
+        reject(new Error(`Timed out waiting ${timeoutMs}ms for standby ack`));
+      }, timeoutMs);
+      timeout.unref?.();
+
+      this.pendingStandby = {
+        taskId,
+        resolve,
+        reject,
+        timeout,
+      };
+
+      try {
+        this.sendStandby(taskId);
+      } catch (error) {
+        clearTimeout(timeout);
+        this.pendingStandby = undefined;
+        reject(error instanceof Error ? error : new Error(String(error)));
+      }
+    });
+  }
+
   sendResume(taskId?: string): void {
     if (!this.persona) {
       throw new Error('Cannot send resume before auth.ack');
@@ -134,6 +185,37 @@ export class AgentCommsWsClient {
       type: 'resume',
       persona: this.persona,
       task_id: taskId,
+    });
+  }
+
+  async sendResumeAndWait(
+    taskId?: string,
+    timeoutMs = 5_000,
+  ): Promise<{ persona: string; taskId?: string; status: 'active' }> {
+    if (!this.persona) {
+      throw new Error('Cannot send resume before auth.ack');
+    }
+
+    return new Promise((resolve, reject) => {
+      const timeout = setTimeout(() => {
+        this.pendingResume = undefined;
+        reject(new Error(`Timed out waiting ${timeoutMs}ms for resume ack`));
+      }, timeoutMs);
+      timeout.unref?.();
+
+      this.pendingResume = {
+        resolve,
+        reject,
+        timeout,
+      };
+
+      try {
+        this.sendResume(taskId);
+      } catch (error) {
+        clearTimeout(timeout);
+        this.pendingResume = undefined;
+        reject(error instanceof Error ? error : new Error(String(error)));
+      }
     });
   }
 
@@ -173,6 +255,7 @@ export class AgentCommsWsClient {
       this.authenticated = false;
       this.stopHeartbeat();
       this.rejectPendingOutbound(new Error('Agent Comms WebSocket closed before outbound response'));
+      this.rejectPendingStateTransitions(new Error('Agent Comms WebSocket closed before standby/resume response'));
       if (!this.stopped && !this.lastConnectionError) {
         this.lastConnectionError = 'Agent Comms WebSocket closed before auth.ack';
       }
@@ -245,9 +328,42 @@ export class AgentCommsWsClient {
         this.options.logger?.warn({ frame }, 'extension returned an outbound error frame');
         return;
       }
+      case 'standby.ack': {
+        if (!this.pendingStandby) {
+          return;
+        }
+
+        clearTimeout(this.pendingStandby.timeout);
+        const pending = this.pendingStandby;
+        this.pendingStandby = undefined;
+        pending.resolve({
+          persona: frame.persona,
+          taskId: frame.task_id,
+          status: frame.status,
+        });
+        return;
+      }
+      case 'resume.ack': {
+        if (!this.pendingResume) {
+          return;
+        }
+
+        clearTimeout(this.pendingResume.timeout);
+        const pending = this.pendingResume;
+        this.pendingResume = undefined;
+        pending.resolve({
+          persona: frame.persona,
+          taskId: frame.task_id,
+          status: frame.status,
+        });
+        return;
+      }
       case 'error':
         this.lastConnectionError = `Agent Comms extension error: ${frame.reason}`;
         this.options.logger?.warn({ frame }, 'extension returned an error frame');
+        if (frame.reason === 'persona_mismatch' && this.ws?.readyState === WebSocket.OPEN) {
+          this.ws.close(4009, 'persona_mismatch');
+        }
         return;
     }
   }
@@ -294,6 +410,20 @@ export class AgentCommsWsClient {
       clearTimeout(pending.timeout);
       pending.reject(error);
       this.pendingOutbound.delete(clientMsgId);
+    }
+  }
+
+  private rejectPendingStateTransitions(error: Error): void {
+    if (this.pendingStandby) {
+      clearTimeout(this.pendingStandby.timeout);
+      this.pendingStandby.reject(error);
+      this.pendingStandby = undefined;
+    }
+
+    if (this.pendingResume) {
+      clearTimeout(this.pendingResume.timeout);
+      this.pendingResume.reject(error);
+      this.pendingResume = undefined;
     }
   }
 
