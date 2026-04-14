@@ -28,16 +28,16 @@ mkdir -p "$ICON_DIR"
 
 codex_colors=(
   "#10A37F"
-  "#0EA5A8"
   "#2563EB"
-  "#7C3AED"
+  "#F59E0B"
+  "#EF4444"
 )
 
 claude_colors=(
   "#D97757"
-  "#C96B37"
-  "#B85778"
-  "#8F63D2"
+  "#DB2777"
+  "#7C3AED"
+  "#0F766E"
 )
 
 for index in 1 2 3 4; do
