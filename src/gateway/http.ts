@@ -8,6 +8,7 @@ import type { PostedSlackMessage } from '../slack/post';
 import { taskIdSchema } from '../schema/slack_message';
 import { createHttpSecretMiddleware } from './auth';
 import type { SpawnRequest, SpawnResult } from '../spawn';
+import { refineSpawnModel } from '../spawn-model';
 
 const slackThreadTsInputSchema = z.union([z.string().min(1), z.number().finite()]).transform((value) => String(value));
 
@@ -21,7 +22,8 @@ const spawnRequestSchema = z.object({
   parent_persona: z.string().min(1).nullable().optional(),
   task_id: taskIdSchema,
   reuse_idle: z.boolean().nullable().optional(),
-});
+  model: z.string().min(1).nullable().optional(),
+}).superRefine((value, ctx) => refineSpawnModel(value, ctx));
 
 const outboundOneshotSchema = z.object({
   persona: z.string().min(1),
@@ -155,6 +157,7 @@ export class GatewayHttpServer {
           parentPersona: parsed.data.parent_persona ?? null,
           taskId: parsed.data.task_id,
           reuseIdle: parsed.data.reuse_idle ?? null,
+          model: parsed.data.model ?? undefined,
         });
         response.json(result);
       } catch (error) {

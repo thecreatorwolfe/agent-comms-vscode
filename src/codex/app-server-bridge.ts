@@ -20,6 +20,7 @@ import {
 import { resolveBridgeEnv } from '../mcp/runtime-env';
 import { fetchSelfAgentStatus, formatAgentConnectionSnapshot, formatAgentStatus } from '../mcp/status';
 import { AgentCommsWsClient } from '../mcp/ws-client';
+import { refineSpawnModel, SPAWN_MODEL_PARAM_DESCRIPTION } from '../spawn-model';
 import type { EventFrame } from '../schema/frames';
 
 type JsonRpcId = number | string;
@@ -78,6 +79,7 @@ const agentCommsSpawnInputSchema = z.object({
   personaSuffix: z.string().min(1).optional(),
   instanceNumber: z.number().int().min(1).optional(),
   reuseIdle: z.boolean().optional(),
+  model: z.string().min(1).optional(),
 }).refine(
   (value) => (
     value.customName !== undefined
@@ -85,7 +87,7 @@ const agentCommsSpawnInputSchema = z.object({
     || value.instanceNumber !== undefined
   ),
   'Parent spawns must provide customName, personaSuffix, or instanceNumber so the child terminal is named deterministically.',
-);
+).superRefine((value, ctx) => refineSpawnModel(value, ctx));
 
 const agentCommsRenameInputSchema = z.object({
   customName: z.string().min(1).optional(),
@@ -114,6 +116,7 @@ function buildSpawnToolSchema(): Record<string, unknown> {
       personaSuffix: { type: 'string', minLength: 1 },
       instanceNumber: { type: 'integer', minimum: 1 },
       reuseIdle: { type: 'boolean' },
+      model: { type: 'string', minLength: 1, description: SPAWN_MODEL_PARAM_DESCRIPTION },
     },
     required: ['kind', 'briefFilePath', 'taskId'],
     additionalProperties: false,
@@ -202,7 +205,7 @@ function buildResumeToolSchema(): Record<string, unknown> {
 const AGENT_COMMS_DYNAMIC_TOOLS = [
   {
     name: 'agent_comms_spawn',
-    description: 'Request that the local Agent Comms hub spawn a new Claude or Codex peer in VS Code. This is local-only and does not go through Slack. Parent spawns must assign the child persona up front with customName or with personaSuffix/instanceNumber (optionally plus projectName). The terminal opens under that persona immediately.',
+    description: "Request that the local Agent Comms hub spawn a new Claude or Codex peer in VS Code. This is local-only and does not go through Slack. Parent spawns must assign the child persona up front with customName or with personaSuffix/instanceNumber (optionally plus projectName). The terminal opens under that persona immediately. Pass `model` to choose the spawned Claude session's model (kind='claude' only).",
     inputSchema: buildSpawnToolSchema(),
   },
   {
@@ -846,6 +849,7 @@ class CodexAppServerBridge {
         parent_persona: this.client.getCurrentPersona() ?? this.bridgeEnv.claimedPersona ?? null,
         task_id: parsed.data.taskId,
         reuse_idle: parsed.data.reuseIdle ?? null,
+        model: parsed.data.model ?? null,
       }),
     });
 

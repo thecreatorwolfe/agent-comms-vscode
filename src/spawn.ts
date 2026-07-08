@@ -12,6 +12,7 @@ import type { Logger } from 'pino';
 import { AgentRegistry } from './registry/agents';
 import { buildAutomaticPersona, buildProjectScopedPersona } from './persona/naming';
 import { resolveProjectName } from './persona/project';
+import { normalizeSpawnModel } from './spawn-model';
 
 export interface SpawnRequest {
   kind: 'claude' | 'codex';
@@ -23,6 +24,7 @@ export interface SpawnRequest {
   parentPersona?: string | null;
   taskId: string;
   reuseIdle?: boolean | null;
+  model?: string | null;
 }
 
 export interface SpawnResult {
@@ -68,10 +70,16 @@ export function buildSpawnCommand(
   persona: string,
   briefFilePath: string,
   codexChromeDevtoolsStartupTimeoutSec?: number,
+  model?: string | null,
 ): string {
   const quotedBrief = shellQuote(briefFilePath);
   if (kind === 'claude') {
-    return `~/.agent-comms/bin/claude-agent-comms -n ${shellQuote(persona)} "$(cat ${quotedBrief})"`;
+    const modelArg = model ? ` --model ${shellQuote(normalizeSpawnModel(model))}` : '';
+    return `~/.agent-comms/bin/claude-agent-comms${modelArg} -n ${shellQuote(persona)} "$(cat ${quotedBrief})"`;
+  }
+
+  if (model) {
+    throw new SpawnPreconditionError("Model selection is only supported for kind='claude' spawns.");
   }
 
   const chromeDevtoolsTimeoutArg = Number.isInteger(codexChromeDevtoolsStartupTimeoutSec)
@@ -168,6 +176,7 @@ export async function spawnAgent(req: SpawnRequest, dependencies: SpawnAgentDepe
       reservation.persona,
       req.briefFilePath,
       dependencies.codexChromeDevtoolsStartupTimeoutSec,
+      req.model,
     ),
     true,
   );
