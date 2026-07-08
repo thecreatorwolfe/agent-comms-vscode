@@ -21,6 +21,14 @@ export interface SlackChannelMessageEvent {
   thread_ts?: string;
 }
 
+export interface SlackSlashCommandEvent {
+  user: string;
+  text: string;
+  channel: string;
+  command: string;
+  ts: string;
+}
+
 export interface SlackRuntimeIdentity {
   botId?: string;
   botUserId?: string;
@@ -39,8 +47,11 @@ export interface SlackBoltRuntime {
 export interface CreateSlackBoltRuntimeOptions {
   env: AgentCommsEnv;
   logger?: Logger;
+  onFault?: (source: string, error: unknown) => void;
   onAppMention: (event: SlackAppMentionEvent) => Promise<void> | void;
   onChannelMessage: (event: SlackChannelMessageEvent) => Promise<void> | void;
+  onHumanChannelMessage?: (event: SlackChannelMessageEvent) => Promise<void> | void;
+  onSlashCommand?: (event: SlackSlashCommandEvent) => Promise<string | void> | string | void;
 }
 
 export function isTrustedAgentRelayEvent(
@@ -74,59 +85,101 @@ export function createSlackBoltRuntime(options: CreateSlackBoltRuntimeOptions): 
   let identity: SlackRuntimeIdentity | undefined;
 
   app.event('app_mention', async ({ event }) => {
-    if (event.channel !== options.env.SLACK_CHANNEL_ID) {
-      return;
-    }
+    try {
+      if (event.channel !== options.env.SLACK_CHANNEL_ID) {
+        return;
+      }
 
-    await options.onAppMention({
-      user: event.user ?? 'unknown',
-      text: event.text,
-      channel: event.channel,
-      ts: event.ts,
-      thread_ts: 'thread_ts' in event ? event.thread_ts : undefined,
-    });
+      await options.onAppMention({
+        user: event.user ?? 'unknown',
+        text: event.text,
+        channel: event.channel,
+        ts: event.ts,
+        thread_ts: 'thread_ts' in event ? event.thread_ts : undefined,
+      });
+    } catch (error) {
+      options.logger?.error({ err: error, ts: event.ts }, 'slack app_mention handler failed');
+      options.onFault?.('slack.app_mention', error);
+    }
+  });
+
+  app.command('/agent-comms', async ({ command, ack }) => {
+    try {
+      if (command.channel_id !== options.env.SLACK_CHANNEL_ID) {
+        await ack({
+          response_type: 'ephemeral',
+          text: 'Agent Comms slash commands are only enabled in the configured coordination channel.',
+        });
+        return;
+      }
+
+      const responseText = await options.onSlashCommand?.({
+        user: command.user_id,
+        text: command.text,
+        channel: command.channel_id,
+        command: command.command,
+        ts: new Date().toISOString(),
+      });
+      await ack({
+        response_type: 'ephemeral',
+        text: responseText ?? 'Agent Comms acknowledged.',
+      });
+    } catch (error) {
+      options.logger?.error({ err: error, command: command.command }, 'slack slash command handler failed');
+      options.onFault?.('slack.command', error);
+      await ack({
+        response_type: 'ephemeral',
+        text: 'Agent Comms command failed. Check the Agent Comms output channel in VS Code.',
+      });
+    }
   });
 
   app.event('message', async ({ event }) => {
-    if (!('channel' in event) || event.channel !== options.env.SLACK_CHANNEL_ID) {
-      return;
-    }
+    try {
+      if (!('channel' in event) || event.channel !== options.env.SLACK_CHANNEL_ID) {
+        return;
+      }
 
-    if (!('text' in event) || typeof event.text !== 'string') {
-      return;
-    }
+      if (!('text' in event) || typeof event.text !== 'string') {
+        return;
+      }
 
-    const subtype = 'subtype' in event ? event.subtype : undefined;
-    const botId = 'bot_id' in event ? event.bot_id : undefined;
-    const normalizedEvent = {
-      user: 'user' in event ? event.user : undefined,
-      bot_id: botId,
-      subtype,
-      text: event.text,
-      channel: event.channel,
-      ts: event.ts,
-      thread_ts: 'thread_ts' in event ? event.thread_ts : undefined,
-    };
-    const isBotStyleEvent = subtype === 'bot_message'
-      || Boolean(normalizedEvent.bot_id)
-      || Boolean(normalizedEvent.user && identity?.botUserId && normalizedEvent.user === identity.botUserId);
-    if (!isBotStyleEvent) {
-      return;
-    }
+      const subtype = 'subtype' in event ? event.subtype : undefined;
+      const botId = 'bot_id' in event ? event.bot_id : undefined;
+      const normalizedEvent = {
+        user: 'user' in event ? event.user : undefined,
+        bot_id: botId,
+        subtype,
+        text: event.text,
+        channel: event.channel,
+        ts: event.ts,
+        thread_ts: 'thread_ts' in event ? event.thread_ts : undefined,
+      };
+      const isBotStyleEvent = subtype === 'bot_message'
+        || Boolean(normalizedEvent.bot_id)
+        || Boolean(normalizedEvent.user && identity?.botUserId && normalizedEvent.user === identity.botUserId);
+      if (!isBotStyleEvent) {
+        await options.onHumanChannelMessage?.(normalizedEvent);
+        return;
+      }
 
-    if (!isTrustedAgentRelayEvent(normalizedEvent, identity)) {
-      options.logger?.warn(
-        {
-          user: normalizedEvent.user,
-          bot_id: normalizedEvent.bot_id,
-          ts: normalizedEvent.ts,
-        },
-        'ignored bot-style Slack message from untrusted sender',
-      );
-      return;
-    }
+      if (!isTrustedAgentRelayEvent(normalizedEvent, identity)) {
+        options.logger?.warn(
+          {
+            user: normalizedEvent.user,
+            bot_id: normalizedEvent.bot_id,
+            ts: normalizedEvent.ts,
+          },
+          'ignored bot-style Slack message from untrusted sender',
+        );
+        return;
+      }
 
-    await options.onChannelMessage(normalizedEvent);
+      await options.onChannelMessage(normalizedEvent);
+    } catch (error) {
+      options.logger?.error({ err: error, ts: 'ts' in event ? event.ts : undefined }, 'slack message handler failed');
+      options.onFault?.('slack.message', error);
+    }
   });
 
   return {
@@ -136,23 +189,33 @@ export function createSlackBoltRuntime(options: CreateSlackBoltRuntimeOptions): 
       return identity;
     },
     async start(): Promise<void> {
-      const auth = await app.client.auth.test();
-      identity = {
-        botId: 'bot_id' in auth && typeof auth.bot_id === 'string' ? auth.bot_id : undefined,
-        botUserId: 'user_id' in auth && typeof auth.user_id === 'string' ? auth.user_id : undefined,
-        appId: 'app_id' in auth && typeof auth.app_id === 'string' ? auth.app_id : undefined,
-        teamId: 'team_id' in auth && typeof auth.team_id === 'string' ? auth.team_id : undefined,
-      };
-      if (!identity.botId && !identity.botUserId) {
-        throw new Error('Slack auth.test did not return a bot identity for Agent Comms.');
-      }
+      try {
+        const auth = await app.client.auth.test();
+        identity = {
+          botId: 'bot_id' in auth && typeof auth.bot_id === 'string' ? auth.bot_id : undefined,
+          botUserId: 'user_id' in auth && typeof auth.user_id === 'string' ? auth.user_id : undefined,
+          appId: 'app_id' in auth && typeof auth.app_id === 'string' ? auth.app_id : undefined,
+          teamId: 'team_id' in auth && typeof auth.team_id === 'string' ? auth.team_id : undefined,
+        };
+        if (!identity.botId && !identity.botUserId) {
+          throw new Error('Slack auth.test did not return a bot identity for Agent Comms.');
+        }
 
-      await app.start();
-      options.logger?.info('Slack Socket Mode started');
+        await app.start();
+        options.logger?.info('Slack Socket Mode started');
+      } catch (error) {
+        options.onFault?.('slack.start', error);
+        throw error;
+      }
     },
     async stop(): Promise<void> {
-      await app.stop();
-      options.logger?.info('Slack Socket Mode stopped');
+      try {
+        await app.stop();
+        options.logger?.info('Slack Socket Mode stopped');
+      } catch (error) {
+        options.onFault?.('slack.stop', error);
+        throw error;
+      }
     },
   };
 }

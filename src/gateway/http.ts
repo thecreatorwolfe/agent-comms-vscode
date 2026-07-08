@@ -9,6 +9,8 @@ import { taskIdSchema } from '../schema/slack_message';
 import { createHttpSecretMiddleware } from './auth';
 import type { SpawnRequest, SpawnResult } from '../spawn';
 
+const slackThreadTsInputSchema = z.union([z.string().min(1), z.number().finite()]).transform((value) => String(value));
+
 const spawnRequestSchema = z.object({
   kind: z.enum(['claude', 'codex']),
   brief_file_path: z.string().min(1),
@@ -23,14 +25,14 @@ const spawnRequestSchema = z.object({
 
 const outboundOneshotSchema = z.object({
   persona: z.string().min(1),
-  thread_ts: z.string().nullable().optional(),
+  thread_ts: slackThreadTsInputSchema.nullable().optional(),
   task_id: taskIdSchema,
   body: z.string().min(1),
   client_msg_id: z.string().uuid(),
 });
 
 const slackHistoryRequestSchema = z.object({
-  thread_ts: z.string().min(1).nullable().optional(),
+  thread_ts: slackThreadTsInputSchema.nullable().optional(),
   limit: z.number().int().min(1).max(50).default(20),
 });
 
@@ -48,6 +50,7 @@ export interface GatewayHttpServerOptions {
   iconsDir: string;
   registry: AgentRegistry;
   logger?: Logger;
+  onFault?: (source: string, error: unknown) => void;
   onSpawn: (request: SpawnRequest) => Promise<SpawnResult>;
   onOutbound: (request: z.infer<typeof outboundOneshotSchema>) => Promise<PostedSlackMessage>;
   onReadSlack: (request: z.infer<typeof slackHistoryRequestSchema>) => Promise<{
@@ -101,11 +104,33 @@ export class GatewayHttpServer {
   constructor(options: GatewayHttpServerOptions) {
     this.options = options;
     this.server = http.createServer(this.app);
+    this.server.on('error', (error) => {
+      this.options.logger?.error({ err: error }, 'http server error');
+      this.options.onFault?.('http.server', error);
+    });
+    this.server.on('clientError', (error, socket) => {
+      this.options.logger?.warn({ err: error }, 'http client error');
+      this.options.onFault?.('http.client', error);
+      if (socket.writable) {
+        socket.end('HTTP/1.1 400 Bad Request\r\n\r\n');
+      }
+    });
     this.configure();
   }
 
   private configure(): void {
     this.app.use(express.json({ limit: '1mb' }));
+    this.app.use((error: unknown, _request: express.Request, response: express.Response, next: express.NextFunction) => {
+      const isJsonSyntaxError = error instanceof SyntaxError
+        && typeof error.message === 'string'
+        && 'body' in error;
+      if (isJsonSyntaxError) {
+        response.status(400).json({ error: 'invalid_json', details: error.message });
+        return;
+      }
+
+      next(error);
+    });
     this.app.get('/healthz', (_request, response) => {
       response.json({ ok: true });
     });
@@ -179,7 +204,15 @@ export class GatewayHttpServer {
           persona: agent.persona,
           kind: agent.kind,
           status: agent.status,
+          activity: agent.activity,
           task_id: agent.taskId ?? null,
+          registration_required: agent.registrationRequired ?? false,
+          pending_message_count: agent.pendingMessageCount ?? 0,
+          pending_urgent_message_count: agent.pendingUrgentMessageCount ?? 0,
+          last_inbound_from: agent.lastInboundFrom ?? null,
+          last_inbound_at: agent.lastInboundAt ?? null,
+          last_inbound_task_id: agent.lastInboundTaskId ?? null,
+          last_inbound_thread_ts: agent.lastInboundThreadTs ?? null,
           connected_at: new Date(agent.connectedAt).toISOString(),
         })),
       });

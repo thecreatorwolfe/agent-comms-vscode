@@ -8,23 +8,26 @@ import { createLogger } from '../log';
 import {
   agentCommsReadSlackInputSchema,
   agentCommsReplyInputSchema,
+  buildRegistrationRequiredMessage,
   buildProtocolSlackMessage,
   formatSlackHistoryTranscript,
+  hasPersonaOverride,
   normalizeRecipients,
+  renamePersonaForReply,
 } from './reply';
-import { fetchSelfAgentStatus, formatAgentStatus } from './status';
+import { fetchSelfAgentStatus, formatAgentConnectionSnapshot, formatAgentStatus } from './status';
 import { resolveBridgeEnv } from './runtime-env';
 import { AgentCommsWsClient } from './ws-client';
 
-function buildElicitationMessage(frame: {
+function buildEventLogMessage(frame: {
+  delivery_id: string;
   from_persona: string;
   to_persona: string;
   task_id?: string;
-  thread_ts: string;
   body_raw: string;
 }): string {
-  const task = frame.task_id ? `Task: ${frame.task_id}\n` : '';
-  return `Slack message from ${frame.from_persona} to ${frame.to_persona}\n${task}Thread: ${frame.thread_ts}\n\n${frame.body_raw}`;
+  const task = frame.task_id ? ` task=${frame.task_id}` : '';
+  return `agent-comms delivery=${frame.delivery_id} ping from ${frame.from_persona} to ${frame.to_persona}${task}: ${frame.body_raw}`;
 }
 
 async function main(): Promise<void> {
@@ -32,16 +35,17 @@ async function main(): Promise<void> {
   const logger = createLogger({
     level: bridgeEnv.logLevel ?? (process.env.LOG_LEVEL as AgentCommsLogLevel | undefined) ?? 'info',
     destination: 'stderr',
+    logFilePrefix: 'codex-bridge',
   });
 
-  const { port, secret, claimedPersona } = bridgeEnv;
+  const { port, secret, claimedPersona, profileId, pid } = bridgeEnv;
 
   const server = new McpServer(
     { name: 'agent-comms-codex', version: '0.0.1' },
     {
-      capabilities: {},
+      capabilities: { logging: {} },
       instructions:
-        'Agent Comms delivers Slack coordination messages into this Codex session. Reply with the provided tools when you need to send a protocol-formatted Slack message or mark the session standby.',
+        'Agent Comms delivers Slack coordination messages into this Codex session. Connected sessions default to active waiting/listening. Use agent_comms_resume({ taskId: "..." }) only when you are actively working and want pings to interrupt the session. Use agent_comms_standby({ taskId: "..." }) only when you intentionally want reusable idle/standby behavior. Preferred minimal send: agent_comms_reply({ recipients: ["alfred-2"], body: "Need review." }). Omit subject, taskId, and threadTs unless they materially help. If agent_comms_status reports Registration required: yes, call agent_comms_rename({ customName: "your-persona" }) first or include customName/projectName/personaSuffix/instanceNumber in that same structured reply call so the hub renames you before the first visible Slack post. Messages relayed from NICK are high priority and should be checked promptly.',
     },
   );
 
@@ -50,42 +54,71 @@ async function main(): Promise<void> {
     port,
     secret,
     cwd: cwd(),
+    pid,
     persona: claimedPersona,
+    profileId,
     logger,
     onEvent: async (frame) => {
-      await server.server.elicitInput({
-        mode: 'form',
-        message: buildElicitationMessage(frame),
-        requestedSchema: {
-          type: 'object',
-          properties: {
-            acknowledged: {
-              type: 'boolean',
-              title: 'Acknowledged',
-              description: 'Acknowledge the message so Codex can continue processing it in-session.',
-              default: true,
-            },
-          },
-          required: ['acknowledged'],
-        },
-      });
+      logger.info({
+        deliveryId: frame.delivery_id,
+        fromPersona: frame.from_persona,
+        toPersona: frame.to_persona,
+        slackTs: frame.slack_ts,
+        taskId: frame.task_id,
+      }, 'received codex agent-comms event');
+      const surfacedStartedAt = Date.now();
+      const loggingResult = await server.server.sendLoggingMessage({
+        level: 'info',
+        logger: 'agent-comms',
+        data: buildEventLogMessage(frame),
+      }).then(
+        () => ({ status: 'fulfilled' as const }),
+        (reason) => ({ status: 'rejected' as const, reason }),
+      );
+      const surfacedElapsedMs = Date.now() - surfacedStartedAt;
+      logger.info({
+        deliveryId: frame.delivery_id,
+        surfacedElapsedMs,
+        logging: loggingResult.status,
+      }, 'codex agent-comms event logged for terminal wake-up');
+      try {
+        client.sendEventAck({
+          delivery_id: frame.delivery_id,
+          surface_status: 'ok',
+          surface_mechanism: 'codex_log_only',
+          logging_status: loggingResult.status === 'fulfilled' ? 'ok' : 'failed',
+          surface_elapsed_ms: surfacedElapsedMs,
+        });
+      } catch (error) {
+        logger.warn({ err: error, deliveryId: frame.delivery_id }, 'failed to send codex event ack to hub');
+      }
+      if (loggingResult.status === 'rejected') {
+        logger.warn({ err: loggingResult.reason }, 'failed to log codex agent-comms event');
+      }
     },
   });
 
   server.registerTool(
     'agent_comms_spawn',
     {
-      description: 'Request that the local Agent Comms hub spawn a new Claude or Codex peer in VS Code. This is local-only and does not go through Slack.',
+      description: 'Request that the local Agent Comms hub spawn a new Claude or Codex peer in VS Code. This is local-only and does not go through Slack. Parent spawns must assign the child persona up front with customName or with personaSuffix/instanceNumber (optionally plus projectName). The terminal opens under that persona immediately.',
       inputSchema: z.object({
         kind: z.enum(['claude', 'codex']),
-        briefFilePath: z.string().min(1),
-        taskId: z.string().min(1),
-        customName: z.string().min(1).optional(),
-        projectName: z.string().min(1).optional(),
-        personaSuffix: z.string().min(1).optional(),
-        instanceNumber: z.number().int().min(1).optional(),
-        reuseIdle: z.boolean().optional(),
-      }),
+        briefFilePath: z.string().min(1).describe('Absolute path to the child brief file to feed into the new terminal session.'),
+        taskId: z.string().min(1).describe('Required task id for the spawned child session.'),
+        customName: z.string().min(1).optional().describe('Preferred when you want an exact child persona. Example: pricing-pass-codex-2.'),
+        projectName: z.string().min(1).optional().describe('Optional project segment override for the child persona.'),
+        personaSuffix: z.string().min(1).optional().describe('Optional suffix for project-scoped naming. Example: alfred-2 or reviewer.'),
+        instanceNumber: z.number().int().min(1).optional().describe('Optional automatic instance number when you want project-kind numbering.'),
+        reuseIdle: z.boolean().optional().describe('Reuse an idle matching peer instead of spawning fresh only when that is intentional.'),
+      }).refine(
+        (value) => (
+          value.customName !== undefined
+          || value.personaSuffix !== undefined
+          || value.instanceNumber !== undefined
+        ),
+        'Parent spawns must provide customName, personaSuffix, or instanceNumber so the child terminal is named deterministically.',
+      ),
     },
     async ({ kind, briefFilePath, taskId, customName, projectName, personaSuffix, instanceNumber, reuseIdle }) => {
       await client.waitForAuth();
@@ -135,12 +168,12 @@ async function main(): Promise<void> {
   server.registerTool(
     'agent_comms_rename',
     {
-      description: 'Rename this live agent without restarting. You can change the task/project segment, the persona suffix, or the full persona.',
+      description: 'Rename this live agent without restarting. Use this before the first Slack post when agent_comms_status shows Registration required: yes. You can change the full persona with customName, or rebuild it with projectName plus personaSuffix/instanceNumber.',
       inputSchema: z.object({
-        customName: z.string().min(1).optional(),
-        projectName: z.string().min(1).optional(),
-        personaSuffix: z.string().min(1).optional(),
-        instanceNumber: z.number().int().min(1).optional(),
+        customName: z.string().min(1).optional().describe('Exact full persona to claim. Example: checkout-flow-codex-3.'),
+        projectName: z.string().min(1).optional().describe('Optional project segment override.'),
+        personaSuffix: z.string().min(1).optional().describe('Optional persona suffix when using project-scoped naming.'),
+        instanceNumber: z.number().int().min(1).optional().describe('Optional automatic instance number when using project-kind numbering.'),
       }).refine(
         (value) => (
           value.customName !== undefined
@@ -185,7 +218,10 @@ async function main(): Promise<void> {
         throw new Error('Rename request did not return a persona');
       }
 
-      client.setCurrentPersona(payload.persona);
+      client.setCurrentPersona(payload.persona, {
+        personaSource: 'claimed',
+        registrationRequired: false,
+      });
       return {
         content: [
           {
@@ -257,11 +293,30 @@ async function main(): Promise<void> {
   server.registerTool(
     'agent_comms_reply',
     {
-      description: 'Send a protocol-formatted Slack reply through the local Agent Comms hub.',
+      description: 'Send a Slack message through the local Agent Comms hub. Preferred minimal usage: agent_comms_reply({ recipients: ["alfred-2"], body: "Need review." }). The tool auto-builds the protocol header and can rename your persona inline before sending.',
       inputSchema: agentCommsReplyInputSchema,
     },
-    async ({ message, recipients, subject, body, taskId, threadTs }) => {
-      const persona = await client.waitForAuth();
+    async ({ message, recipients, subject, body, taskId, threadTs, customName, projectName, personaSuffix, instanceNumber }) => {
+      let persona = await client.waitForAuth();
+      const connection = client.getConnectionSnapshot();
+      const override = { customName, projectName, personaSuffix, instanceNumber };
+      if (connection.registrationRequired && !hasPersonaOverride(override)) {
+        throw new Error(buildRegistrationRequiredMessage(persona));
+      }
+      if (hasPersonaOverride(override)) {
+        const renamed = await renamePersonaForReply({
+          port,
+          secret,
+          persona,
+          override,
+        });
+        client.setCurrentPersona(renamed.persona, {
+          personaSource: 'claimed',
+          registrationRequired: false,
+        });
+        persona = renamed.persona;
+      }
+
       const outboundBody = message ?? buildProtocolSlackMessage({
         from: persona,
         recipients: normalizeRecipients(recipients ?? []),
@@ -290,27 +345,46 @@ async function main(): Promise<void> {
   server.registerTool(
     'agent_comms_status',
     {
-      description: 'Read the live Agent Comms registry entry for this Codex session so you can confirm whether you are active or idle.',
+      description: 'Read the live Agent Comms registry entry for this Codex session so you can confirm whether you are idle, active-working, or active-waiting, whether inbound pings are pending, and whether this session still needs persona registration before its first Slack post.',
       inputSchema: z.object({}),
     },
     async () => {
-      const persona = await client.waitForAuth();
-      const status = await fetchSelfAgentStatus({
-        port,
-        secret,
-        persona,
-      });
+      const connection = client.getConnectionSnapshot();
+      if (!connection.authenticated || !connection.persona) {
+        return {
+          content: [{ type: 'text', text: formatAgentConnectionSnapshot(connection) }],
+        };
+      }
 
-      return {
-        content: [{ type: 'text', text: formatAgentStatus(status) }],
-      };
+      try {
+        const status = await fetchSelfAgentStatus({
+          port,
+          secret,
+          persona: connection.persona,
+        });
+
+        return {
+          content: [{
+            type: 'text',
+            text: `${formatAgentStatus(status)}\n${formatAgentConnectionSnapshot(connection)}`,
+          }],
+        };
+      } catch (error) {
+        const message = error instanceof Error ? error.message : String(error);
+        return {
+          content: [{
+            type: 'text',
+            text: `${formatAgentConnectionSnapshot(connection)}\nRegistry error: ${message}`,
+          }],
+        };
+      }
     },
   );
 
   server.registerTool(
     'agent_comms_standby',
     {
-      description: 'Mark this Codex agent idle but still reachable for future Slack messages.',
+      description: 'Mark this Codex agent idle and reusable while still reachable for future Slack messages.',
       inputSchema: z.object({
         taskId: z.string().min(1),
       }),
@@ -319,7 +393,7 @@ async function main(): Promise<void> {
       await client.waitForAuth();
       const status = await client.sendStandbyAndWait(taskId);
       return {
-        content: [{ type: 'text', text: `Marked ${status.persona} standby for task ${status.taskId}. Status: ${status.status}.` }],
+        content: [{ type: 'text', text: `Marked ${status.persona} standby for task ${status.taskId}. Status: ${status.status}. Activity: ${status.activity}.` }],
       };
     },
   );
@@ -327,7 +401,7 @@ async function main(): Promise<void> {
   server.registerTool(
     'agent_comms_resume',
     {
-      description: 'Mark this Codex agent active again.',
+      description: 'Mark this Codex agent active again. Connected sessions already default to active waiting/listening. Pass `taskId` only when you are actively working on a task and want pings to interrupt the session. Omit `taskId` when you want to stay active-waiting at the prompt without prompt injection.',
       inputSchema: z.object({
         taskId: z.string().optional(),
       }),
@@ -336,7 +410,7 @@ async function main(): Promise<void> {
       await client.waitForAuth();
       const status = await client.sendResumeAndWait(taskId);
       return {
-        content: [{ type: 'text', text: `Marked ${status.persona} active${status.taskId ? ` for ${status.taskId}` : ''}. Status: ${status.status}.` }],
+        content: [{ type: 'text', text: `Marked ${status.persona} active${status.taskId ? ` for ${status.taskId}` : ''}. Status: ${status.status}. Activity: ${status.activity}.` }],
       };
     },
   );

@@ -1,8 +1,10 @@
+import { randomUUID } from 'node:crypto';
 import type { Logger } from 'pino';
 import { PersonaAllocator, type PersonaAllocation } from './allocator';
 import {
   buildAutomaticPersona,
   buildProjectScopedPersona,
+  buildUnregisteredPersona,
   extractPersonaSuffix,
   type AgentKind,
 } from '../persona/naming';
@@ -14,12 +16,15 @@ export interface AgentSocketLike {
   terminate?(): void;
 }
 
+export type AgentActivityState = 'working' | 'waiting';
+
 export interface ReservationRecord extends PersonaAllocation {
   createdAt: number;
   expiresAt: number;
   briefFilePath: string;
   parentPersona?: string | null;
   taskId: string;
+  profileId: string;
 }
 
 export interface AgentRecord extends PersonaAllocation {
@@ -29,10 +34,19 @@ export interface AgentRecord extends PersonaAllocation {
   lastHeartbeatAt: number;
   socket: AgentSocketLike;
   status: 'active' | 'idle';
+  activity: AgentActivityState;
   taskId?: string;
   parentPersona?: string | null;
   briefFilePath?: string;
   disconnectDeadlineAt?: number;
+  profileId?: string;
+  registrationRequired: boolean;
+  pendingMessageCount: number;
+  pendingUrgentMessageCount: number;
+  lastInboundFrom?: string;
+  lastInboundAt?: string;
+  lastInboundTaskId?: string;
+  lastInboundThreadTs?: string;
 }
 
 export interface ReserveAgentParams {
@@ -45,6 +59,7 @@ export interface ReserveAgentParams {
   instanceNumber?: number | null;
   parentPersona?: string | null;
   projectOverride?: string | null;
+  profileId?: string | null;
 }
 
 export interface AttachAgentParams {
@@ -54,6 +69,7 @@ export interface AttachAgentParams {
   socket: AgentSocketLike;
   persona?: string | null;
   projectOverride?: string | null;
+  profileId?: string | null;
 }
 
 export interface AgentRegistryOptions {
@@ -86,6 +102,10 @@ export class AgentRegistry {
     this.logger = options.logger;
   }
 
+  private resolveActivityState(taskId?: string | null): AgentActivityState {
+    return taskId?.trim() ? 'working' : 'waiting';
+  }
+
   reserve(params: ReserveAgentParams, now = Date.now()): ReservationRecord {
     const project = resolveProjectName({ cwd: params.cwd, override: params.projectOverride });
     const allocation = this.allocator.reserve(project, params.kind, {
@@ -100,6 +120,7 @@ export class AgentRegistry {
       briefFilePath: params.briefFilePath,
       parentPersona: params.parentPersona,
       taskId: params.taskId,
+      profileId: params.profileId ?? randomUUID(),
     };
 
     this.reservations.set(reservation.persona, reservation);
@@ -120,6 +141,7 @@ export class AgentRegistry {
           cwd: params.cwd,
           lastHeartbeatAt: now,
           disconnectDeadlineAt: undefined,
+          profileId: params.profileId ?? existing.profileId,
         };
 
         this.agents.set(resumed.persona, resumed);
@@ -128,7 +150,27 @@ export class AgentRegistry {
 
       const reservation = this.reservations.get(claimedPersona);
       if (!reservation) {
-        throw new Error(`Missing reservation for persona "${claimedPersona}"`);
+        // Allow long-lived bridge processes to recover their claimed persona after
+        // a hub restart or any registry reset that lost in-memory reservations.
+        const project = resolveProjectName({ cwd: params.cwd, override: params.projectOverride });
+        const allocation = this.allocator.reserve(project, params.kind, { customName: claimedPersona });
+          const recovered: AgentRecord = {
+            ...allocation,
+            cwd: params.cwd,
+            pid: params.pid,
+            socket: params.socket,
+            connectedAt: now,
+            lastHeartbeatAt: now,
+            status: 'active',
+            activity: 'waiting',
+            profileId: params.profileId ?? randomUUID(),
+            registrationRequired: false,
+            pendingMessageCount: 0,
+            pendingUrgentMessageCount: 0,
+          };
+
+        this.agents.set(recovered.persona, recovered);
+        return recovered;
       }
 
       this.reservations.delete(claimedPersona);
@@ -140,7 +182,12 @@ export class AgentRegistry {
         connectedAt: now,
         lastHeartbeatAt: now,
         status: 'active',
+        activity: 'waiting',
         taskId: reservation.taskId,
+        profileId: params.profileId ?? reservation.profileId,
+        registrationRequired: false,
+        pendingMessageCount: 0,
+        pendingUrgentMessageCount: 0,
       };
 
       this.agents.set(agent.persona, agent);
@@ -157,6 +204,11 @@ export class AgentRegistry {
       connectedAt: now,
       lastHeartbeatAt: now,
       status: 'active',
+      activity: 'waiting',
+      profileId: params.profileId ?? randomUUID(),
+      registrationRequired: false,
+      pendingMessageCount: 0,
+      pendingUrgentMessageCount: 0,
     };
 
     this.agents.set(agent.persona, agent);
@@ -175,8 +227,23 @@ export class AgentRegistry {
     return [...this.agents.values()].filter((agent) => !agent.disconnectDeadlineAt);
   }
 
+  listAll(): AgentRecord[] {
+    return [...this.agents.values()];
+  }
+
   listReservations(): ReservationRecord[] {
     return [...this.reservations.values()];
+  }
+
+  releaseReservation(persona: string): boolean {
+    const reservation = this.reservations.get(persona);
+    if (!reservation) {
+      return false;
+    }
+
+    this.reservations.delete(persona);
+    this.allocator.release(reservation);
+    return true;
   }
 
   findIdleAgent(project: string, kind: AgentKind): AgentRecord | undefined {
@@ -212,9 +279,33 @@ export class AgentRegistry {
     const renamed: AgentRecord = {
       ...agent,
       ...allocation,
+      registrationRequired: false,
     };
     this.agents.set(renamed.persona, renamed);
     return { previousPersona, agent: renamed };
+  }
+
+  invalidateRegistration(persona: string): { previousPersona: string; agent: AgentRecord } {
+    const agent = this.requireAgent(persona);
+    const nextPersona = buildUnregisteredPersona(agent.kind, randomUUID().replace(/-/g, '').slice(0, 10));
+    const allocation = this.allocator.reserve(agent.project, agent.kind, { customName: nextPersona });
+    const previousPersona = agent.persona;
+    this.agents.delete(previousPersona);
+    this.allocator.release(agent);
+
+    const invalidated: AgentRecord = {
+      ...agent,
+      ...allocation,
+      registrationRequired: true,
+      pendingMessageCount: 0,
+      pendingUrgentMessageCount: 0,
+      lastInboundFrom: undefined,
+      lastInboundAt: undefined,
+      lastInboundTaskId: undefined,
+      lastInboundThreadTs: undefined,
+    };
+    this.agents.set(invalidated.persona, invalidated);
+    return { previousPersona, agent: invalidated };
   }
 
   recordHeartbeat(persona: string, now = Date.now()): AgentRecord {
@@ -227,6 +318,7 @@ export class AgentRegistry {
   markStandby(persona: string, taskId: string, now = Date.now()): AgentRecord {
     const agent = this.requireAgent(persona);
     agent.status = 'idle';
+    agent.activity = 'waiting';
     agent.taskId = taskId;
     agent.lastHeartbeatAt = now;
     return agent;
@@ -235,10 +327,48 @@ export class AgentRegistry {
   markResume(persona: string, taskId?: string, now = Date.now()): AgentRecord {
     const agent = this.requireAgent(persona);
     agent.status = 'active';
-    if (taskId) {
+    agent.activity = this.resolveActivityState(taskId);
+    if (taskId?.trim()) {
       agent.taskId = taskId;
+    } else {
+      agent.taskId = undefined;
     }
     agent.lastHeartbeatAt = now;
+    return agent;
+  }
+
+  noteInboundMessage(
+    persona: string,
+    payload: {
+      fromPersona: string;
+      urgent: boolean;
+      receivedAt?: string;
+      taskId?: string;
+      threadTs?: string;
+    },
+  ): AgentRecord {
+    const agent = this.requireAgent(persona);
+    agent.pendingMessageCount = (agent.pendingMessageCount ?? 0) + 1;
+    if (payload.urgent) {
+      agent.pendingUrgentMessageCount = (agent.pendingUrgentMessageCount ?? 0) + 1;
+    } else {
+      agent.pendingUrgentMessageCount = agent.pendingUrgentMessageCount ?? 0;
+    }
+    agent.lastInboundFrom = payload.fromPersona;
+    agent.lastInboundAt = payload.receivedAt ?? new Date().toISOString();
+    agent.lastInboundTaskId = payload.taskId;
+    agent.lastInboundThreadTs = payload.threadTs;
+    return agent;
+  }
+
+  clearPendingMessages(persona: string): AgentRecord {
+    const agent = this.requireAgent(persona);
+    agent.pendingMessageCount = 0;
+    agent.pendingUrgentMessageCount = 0;
+    agent.lastInboundFrom = undefined;
+    agent.lastInboundAt = undefined;
+    agent.lastInboundTaskId = undefined;
+    agent.lastInboundThreadTs = undefined;
     return agent;
   }
 

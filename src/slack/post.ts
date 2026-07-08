@@ -52,9 +52,16 @@ export async function postSlackMessage(options: PostSlackMessageOptions): Promis
     });
   }
 
+  const responseThreadTs = typeof response.message === 'object'
+    && response.message !== null
+    && 'thread_ts' in response.message
+    && typeof response.message.thread_ts === 'string'
+    ? response.message.thread_ts
+    : undefined;
+
   return {
     slackTs: response.ts,
-    threadTs: response.ts,
+    threadTs: responseThreadTs ?? options.threadTs ?? response.ts,
   };
 }
 

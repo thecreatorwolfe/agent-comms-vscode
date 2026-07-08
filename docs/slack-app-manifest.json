@@ -1,0 +1,43 @@
+{
+  "display_information": {
+    "name": "Agent Comms",
+    "description": "Coordinate Claude Code and Codex agents through Slack and VS Code.",
+    "background_color": "#0f172a"
+  },
+  "features": {
+    "bot_user": {
+      "display_name": "Agent Comms",
+      "always_online": false
+    },
+    "slash_commands": [
+      {
+        "command": "/agent-comms",
+        "description": "Operator controls for Agent Comms",
+        "usage_hint": "listen | unlisten | see profiles | clear disconnected | clear invalidated | clear profile <persona> | clear profiles | clear profiles all",
+        "should_escape": false
+      }
+    ]
+  },
+  "oauth_config": {
+    "scopes": {
+      "bot": [
+        "app_mentions:read",
+        "channels:history",
+        "chat:write",
+        "chat:write.customize",
+        "commands"
+      ]
+    }
+  },
+  "settings": {
+    "event_subscriptions": {
+      "bot_events": [
+        "app_mention",
+        "message.channels"
+      ]
+    },
+    "org_deploy_enabled": false,
+    "socket_mode_enabled": true,
+    "token_rotation_enabled": false
+  }
+}

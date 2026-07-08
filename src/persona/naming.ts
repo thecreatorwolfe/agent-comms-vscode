@@ -51,6 +51,11 @@ export function buildProjectScopedPersona(project: string, suffix: string): stri
   return `${sanitizeProjectName(project)}-${validateCustomPersona(suffix)}`;
 }
 
+export function buildUnregisteredPersona(kind: AgentKind, seed?: string): string {
+  const suffix = (seed ?? Math.random().toString(36).slice(2, 12)).replace(/[^a-z0-9]+/g, '').slice(0, 10) || 'pending';
+  return `unregistered-${personaKindByAgentKind[kind]}-${suffix}`;
+}
+
 export function parseAutomaticPersona(persona: string):
   | { project: string; kind: AgentKind; instanceNumber: number }
   | null {

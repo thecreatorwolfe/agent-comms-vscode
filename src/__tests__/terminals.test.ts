@@ -7,6 +7,7 @@ describe('SpawnedTerminalRegistry', () => {
     const registry = new SpawnedTerminalRegistry();
     registry.track('security-audit-codex-1', {
       name: 'security-audit-codex-1',
+      show: vi.fn(),
       dispose,
     });
 
@@ -19,6 +20,7 @@ describe('SpawnedTerminalRegistry', () => {
     const registry = new SpawnedTerminalRegistry();
     const terminal = {
       name: 'security-audit-alfred-1',
+      show: vi.fn(),
       dispose: vi.fn(),
     };
     registry.track('security-audit-alfred-1', terminal);
@@ -31,6 +33,7 @@ describe('SpawnedTerminalRegistry', () => {
     const registry = new SpawnedTerminalRegistry();
     const terminal = {
       name: 'security-audit-codex-1',
+      show: vi.fn(),
       dispose: vi.fn(),
     };
     registry.track('security-audit-codex-1', terminal);

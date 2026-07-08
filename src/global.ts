@@ -3,8 +3,11 @@ import os from 'node:os';
 import path from 'node:path';
 
 export const DEFAULT_AGENT_COMMS_ENV_TEMPLATE = '${userHome}/.agent-comms/.env';
+export const AGENT_COMMS_CODEX_APPROVAL_OVERRIDE = 'approval_policy={granular={sandbox_approval=false,rules=false,skill_approval=false,request_permissions=false,mcp_elicitations=true}}';
+export const AGENT_COMMS_CODEX_APPROVAL_TOML = 'approval_policy = { granular = { sandbox_approval = false, rules = false, skill_approval = false, request_permissions = false, mcp_elicitations = true } }';
 const AGENT_COMMS_CODEX_SECTION = 'mcp_servers.agent-comms';
 const AGENT_COMMS_CLAUDE_SERVER = 'agent-comms';
+const AGENT_COMMS_CODEX_PROFILE_SECTION = 'profiles."agent-comms-codex"';
 
 export interface ResolvePathTemplateOptions {
   workspaceRoot?: string;
@@ -18,8 +21,11 @@ export interface AgentCommsGlobalPaths {
   envFilePath: string;
   launchersDir: string;
   codexLauncherPath: string;
+  codexAppServerLauncherPath: string;
+  codexCliWrapperPath: string;
   claudeLauncherPath: string;
   claudeCliWrapperPath: string;
+  claudeCliResumeWrapperPath: string;
   codexConfigPath: string;
   claudeConfigPath: string;
 }
@@ -67,8 +73,11 @@ export function getAgentCommsGlobalPaths(userHome = os.homedir()): AgentCommsGlo
     envFilePath: path.join(homeDir, '.env'),
     launchersDir,
     codexLauncherPath: path.join(launchersDir, 'codex-server.js'),
+    codexAppServerLauncherPath: path.join(launchersDir, 'codex-app-server-bridge.js'),
+    codexCliWrapperPath: path.join(launchersDir, 'codex-agent-comms'),
     claudeLauncherPath: path.join(launchersDir, 'claude-channel.js'),
     claudeCliWrapperPath: path.join(launchersDir, 'claude-agent-comms'),
+    claudeCliResumeWrapperPath: path.join(launchersDir, 'claude-agent-comms-resume'),
     codexConfigPath: path.join(userHome, '.codex', 'config.toml'),
     claudeConfigPath: path.join(userHome, '.claude.json'),
   };
@@ -78,11 +87,30 @@ function buildLauncherSource(targetPath: string): string {
   return `#!/usr/bin/env node\nrequire(${JSON.stringify(targetPath)});\n`;
 }
 
+function buildCodexCliWrapperSource(): string {
+  return [
+    '#!/usr/bin/env bash',
+    'set -euo pipefail',
+    'exec codex "$@"',
+    '',
+  ].join('\n');
+}
+
 function buildClaudeCliWrapperSource(): string {
   return [
     '#!/usr/bin/env bash',
     'set -euo pipefail',
     'exec claude --dangerously-load-development-channels server:agent-comms "$@"',
+    '',
+  ].join('\n');
+}
+
+function buildClaudeCliResumeWrapperSource(): string {
+  return [
+    '#!/usr/bin/env bash',
+    'set -euo pipefail',
+    'SELF_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"',
+    'exec "$SELF_DIR/claude-agent-comms" --resume "$@"',
     '',
   ].join('\n');
 }
@@ -147,14 +175,55 @@ function replaceOrAppendTomlSection(source: string, sectionName: string, replace
   return replacement;
 }
 
+function removeTomlSection(source: string, sectionName: string): string {
+  const lines = source.split(/\r?\n/);
+  const header = `[${sectionName}]`;
+  const start = lines.findIndex((line) => line.trim() === header);
+
+  if (start === -1) {
+    return source;
+  }
+
+  let end = lines.length;
+  for (let index = start + 1; index < lines.length; index += 1) {
+    if (/^\s*\[[^\]]+\]\s*$/.test(lines[index])) {
+      end = index;
+      break;
+    }
+  }
+
+  const before = lines.slice(0, start).join('\n').trimEnd();
+  const after = lines.slice(end).join('\n').trimStart();
+
+  if (before && after) {
+    return `${before}\n\n${after}`;
+  }
+  if (before) {
+    return before;
+  }
+  if (after) {
+    return after;
+  }
+  return '';
+}
+
+function replaceCodexNeverApprovalPolicy(source: string): string {
+  return source.replace(
+    /^approval_policy\s*=\s*"never"\s*$/m,
+    AGENT_COMMS_CODEX_APPROVAL_TOML,
+  );
+}
+
 export function upsertCodexConfigToml(source: string, launcherPath: string): string {
-  const section = [
+  const mcpSection = [
     `[${AGENT_COMMS_CODEX_SECTION}]`,
     'command = "node"',
     `args = [${quoteTomlString(launcherPath)}]`,
   ].join('\n');
 
-  return `${replaceOrAppendTomlSection(source, AGENT_COMMS_CODEX_SECTION, section)}\n`;
+  const withApprovalPolicy = replaceCodexNeverApprovalPolicy(source);
+  const withMcpSection = replaceOrAppendTomlSection(withApprovalPolicy, AGENT_COMMS_CODEX_SECTION, mcpSection);
+  return `${removeTomlSection(withMcpSection, AGENT_COMMS_CODEX_PROFILE_SECTION).trimEnd()}\n`;
 }
 
 export function upsertClaudeConfigJson(source: string | undefined, launcherPath: string): string {
@@ -185,8 +254,11 @@ export async function ensureGlobalBridgeLaunchers(
   const paths = getAgentCommsGlobalPaths(userHome);
   await fs.mkdir(paths.homeDir, { recursive: true });
   await writeLauncherFile(paths.codexLauncherPath, path.resolve(extensionPath, 'dist/mcp/codex-server.js'));
+  await writeLauncherFile(paths.codexAppServerLauncherPath, path.resolve(extensionPath, 'dist/codex/app-server-bridge.js'));
+  await writeShellScript(paths.codexCliWrapperPath, buildCodexCliWrapperSource());
   await writeLauncherFile(paths.claudeLauncherPath, path.resolve(extensionPath, 'dist/mcp/claude-channel.js'));
   await writeShellScript(paths.claudeCliWrapperPath, buildClaudeCliWrapperSource());
+  await writeShellScript(paths.claudeCliResumeWrapperPath, buildClaudeCliResumeWrapperSource());
   return paths;
 }
 
@@ -211,6 +283,7 @@ export async function getGlobalBridgeInstallStatus(
 ): Promise<{ paths: AgentCommsGlobalPaths; claudeConfigured: boolean; codexConfigured: boolean }> {
   const paths = getAgentCommsGlobalPaths(userHome);
   const codexExisting = (await readTextIfExists(paths.codexConfigPath)) ?? '';
+  const codexWrapperExisting = (await readTextIfExists(paths.codexCliWrapperPath)) ?? '';
   const claudeExisting = await readTextIfExists(paths.claudeConfigPath);
 
   let claudeConfigured = false;
@@ -236,6 +309,8 @@ export async function getGlobalBridgeInstallStatus(
     claudeConfigured,
     codexConfigured:
       codexExisting.includes(`[${AGENT_COMMS_CODEX_SECTION}]`) &&
-      codexExisting.includes(quoteTomlString(paths.codexLauncherPath)),
+      codexExisting.includes(quoteTomlString(paths.codexLauncherPath)) &&
+      !/^approval_policy\s*=\s*"never"\s*$/m.test(codexExisting) &&
+      codexWrapperExisting.includes('exec codex "$@"'),
   };
 }

@@ -1,28 +1,33 @@
+import { randomUUID } from 'node:crypto';
 import path from 'node:path';
 import * as vscode from 'vscode';
 import type { Logger } from 'pino';
 import { loadAgentCommsEnv } from './env';
 import { ensureGlobalBridgeLaunchers } from './global';
-import { createLogger } from './log';
+import { createLogger, resolveAgentCommsLogDir } from './log';
 import {
   createSlackBoltRuntime,
   type SlackAppMentionEvent,
   type SlackChannelMessageEvent,
+  type SlackSlashCommandEvent,
 } from './slack/bolt';
-import { parseAgentSlackEventText, parseHumanSlackControl } from './slack/parse';
+import { parseAgentSlackEventText, parseHumanSlackControl, stripSlackUserMentions } from './slack/parse';
 import { postPersonaMessage, postSlackMessage, type PostedSlackMessage } from './slack/post';
-import { AgentRegistry } from './registry/agents';
+import { AgentRegistry, type AgentRecord } from './registry/agents';
 import { SpawnedTerminalRegistry } from './registry/terminals';
 import { GatewayHttpServer } from './gateway/http';
 import { WsGateway } from './gateway/ws';
 import { PROJECT_OVERRIDE_KEY, resolveProjectName } from './persona/project';
 import { parseAutomaticPersona, resolveRecipientAlias } from './persona/naming';
-import { resolveIconUrl } from './persona/icons';
-import type { ParsedSlackMessage } from './schema/slack_message';
+import { parsedSlackMessageSchema, type ParsedSlackMessage } from './schema/slack_message';
 import { validateSlackMessageText } from './schema/validate';
 import { spawnAgent, type SpawnRequest, type SpawnResult } from './spawn';
-import type { EventFrame } from './schema/frames';
-import { wakeProcessTty } from './wake';
+import { AgentProfileStore } from './profile-store';
+import { OperatorSettingsStore } from './operator-store';
+import {
+  collectPidTerminalMatchContext,
+  formatPidTerminalMatchContext,
+} from './process-tree';
 
 type OutboundRequest = {
   persona: string;
@@ -41,6 +46,11 @@ type RenameRequest = {
 };
 
 type RouteErrorReason = 'schema_invalid' | 'unknown_recipient' | 'slack_api_error';
+
+interface OperatorControlState {
+  listenEnabled: boolean;
+  clearProfilesAwaitingConfirm: 'safe' | 'all' | null;
+}
 
 class RecentlyDeliveredSlackTs {
   private readonly deliveredUntil = new Map<string, number>();
@@ -87,11 +97,17 @@ export interface AgentCommsRuntime {
   dispose(): Promise<void>;
 }
 
+export interface BootstrapOptions {
+  outputChannel?: vscode.OutputChannel;
+  onFault?: (fault: { source: string; error: unknown; message: string }) => void;
+}
+
 class AgentCommsRuntimeImpl implements AgentCommsRuntime {
   constructor(
     private readonly context: vscode.ExtensionContext,
     private readonly workspaceRoot: string,
     private readonly outputChannel: vscode.OutputChannel,
+    private readonly ownOutputChannel: boolean,
     private readonly env: ReturnType<typeof loadAgentCommsEnv>,
     private readonly registry: AgentRegistry,
     private readonly terminals: SpawnedTerminalRegistry,
@@ -110,7 +126,14 @@ class AgentCommsRuntimeImpl implements AgentCommsRuntime {
         persona: agent.persona,
         kind: agent.kind,
         status: agent.status,
+        activity: agent.activity,
+        registrationRequired: agent.registrationRequired ?? false,
         taskId: agent.taskId ?? null,
+        disconnectDeadlineAt: agent.disconnectDeadlineAt ? new Date(agent.disconnectDeadlineAt).toISOString() : null,
+        pendingMessages: agent.pendingMessageCount ?? 0,
+        pendingUrgentMessages: agent.pendingUrgentMessageCount ?? 0,
+        lastInboundFrom: agent.lastInboundFrom ?? null,
+        lastInboundAt: agent.lastInboundAt ?? null,
         connectedAt: new Date(agent.connectedAt).toISOString(),
       })),
       reservations: this.registry.listReservations().map((reservation) => ({
@@ -197,7 +220,9 @@ class AgentCommsRuntimeImpl implements AgentCommsRuntime {
     await this.wsGateway.stop();
     await this.httpGateway.stop();
     await this.slack.stop();
-    this.outputChannel.dispose();
+    if (this.ownOutputChannel) {
+      this.outputChannel.dispose();
+    }
   }
 }
 
@@ -213,49 +238,420 @@ function getPrimaryWorkspaceRoot(): string {
   return workspaceFolder.uri.fsPath;
 }
 
-async function announceAgentOnline(
-  slack: ReturnType<typeof createSlackBoltRuntime>,
-  env: ReturnType<typeof loadAgentCommsEnv>,
-  agent:
-    | {
-        persona: string;
-        taskId?: string;
-        parentPersona?: string | null;
-        kind: 'claude' | 'codex';
-      }
-    | undefined,
-  slackIconsBaseUrl?: string,
-): Promise<void> {
-  if (!agent) {
-    return;
-  }
-
-  const text = agent.parentPersona
-    ? `${agent.persona} ONLINE. Task: ${agent.taskId ?? 'unknown'}. Peer of ${agent.parentPersona}.`
-    : `${agent.persona} ONLINE. Task: ${agent.taskId ?? 'unknown'}.`;
-
-  await postSlackMessage({
-    client: slack.client,
-    channel: env.SLACK_CHANNEL_ID,
-    text,
-    username: agent.persona,
-    iconUrl: slackIconsBaseUrl
-      ? resolveIconUrl({ persona: agent.persona, kind: agent.kind, iconsBaseUrl: slackIconsBaseUrl })
-      : undefined,
-  });
-}
-
 function normalizeConfiguredBaseUrl(value: string | undefined): string | undefined {
   const trimmed = value?.trim();
   return trimmed ? trimmed.replace(/\/+$/, '') : undefined;
 }
 
-async function sendTerminalEscape(terminal: vscode.Terminal): Promise<void> {
+async function sendTerminalEscape(terminal: { show(preserveFocus?: boolean): void }): Promise<void> {
   terminal.show(true);
   await new Promise((resolve) => setTimeout(resolve, 50));
   await vscode.commands.executeCommand('workbench.action.terminal.sendSequence', {
     text: '\u001b',
   });
+}
+
+async function sendTerminalEnter(terminal: { show(preserveFocus?: boolean): void }): Promise<void> {
+  terminal.show(true);
+  await new Promise((resolve) => setTimeout(resolve, 50));
+  await vscode.commands.executeCommand('workbench.action.terminal.sendSequence', {
+    text: '\r',
+  });
+}
+
+type TerminalLookupResult = {
+  terminal?: vscode.Terminal;
+  matchedBy?: 'pid' | 'tty+tpgid' | 'tty';
+  targetDebug: string;
+  terminalsDebug: string;
+};
+
+async function describeVisibleTerminals(): Promise<string> {
+  const descriptions = await Promise.all(vscode.window.terminals.map(async (terminal) => {
+    try {
+      const terminalPid = await terminal.processId;
+      if (!terminalPid) {
+        return `${terminal.name}{pid=unresolved}`;
+      }
+      const context = await collectPidTerminalMatchContext(terminalPid);
+      return `${terminal.name}{${formatPidTerminalMatchContext(terminalPid, context)}}`;
+    } catch (error) {
+      const message = error instanceof Error ? error.message : String(error);
+      return `${terminal.name}{error=${message}}`;
+    }
+  }));
+  return descriptions.length > 0 ? descriptions.join('; ') : 'none';
+}
+
+async function findTerminalByPid(pid: number): Promise<TerminalLookupResult> {
+  const targetContext = await collectPidTerminalMatchContext(pid);
+  const targetDebug = formatPidTerminalMatchContext(pid, targetContext);
+  if (targetContext.lineage.size === 0) {
+    return {
+      targetDebug,
+      terminalsDebug: await describeVisibleTerminals(),
+    };
+  }
+
+  for (const terminal of vscode.window.terminals) {
+    try {
+      const terminalPid = await terminal.processId;
+      if (!terminalPid) {
+        continue;
+      }
+
+      if (targetContext.lineage.has(terminalPid)) {
+        return {
+          terminal,
+          matchedBy: 'pid',
+          targetDebug,
+          terminalsDebug: await describeVisibleTerminals(),
+        };
+      }
+    } catch {
+      // Ignore terminals whose process id cannot be resolved.
+    }
+  }
+
+  let ttyOnlyTerminal: vscode.Terminal | undefined;
+  let ttyOnlyMatchCount = 0;
+  if (targetContext.ttys.size > 0) {
+    for (const terminal of vscode.window.terminals) {
+      try {
+        const terminalPid = await terminal.processId;
+        if (!terminalPid) {
+          continue;
+        }
+        const terminalContext = await collectPidTerminalMatchContext(terminalPid);
+        const sharesTty = [...terminalContext.ttys].some((tty) => targetContext.ttys.has(tty));
+        if (!sharesTty) {
+          continue;
+        }
+        const sharesTerminalProcessGroup = [...terminalContext.tpgids].some((tpgid) => targetContext.tpgids.has(tpgid));
+        if (sharesTerminalProcessGroup) {
+          return {
+            terminal,
+            matchedBy: 'tty+tpgid',
+            targetDebug,
+            terminalsDebug: await describeVisibleTerminals(),
+          };
+        }
+        ttyOnlyTerminal = terminal;
+        ttyOnlyMatchCount += 1;
+      } catch {
+        // Ignore terminals whose process id cannot be resolved.
+      }
+    }
+  }
+
+  if (ttyOnlyTerminal && ttyOnlyMatchCount === 1) {
+    return {
+      terminal: ttyOnlyTerminal,
+      matchedBy: 'tty',
+      targetDebug,
+      terminalsDebug: await describeVisibleTerminals(),
+    };
+  }
+
+  return {
+    targetDebug,
+    terminalsDebug: await describeVisibleTerminals(),
+  };
+}
+
+async function trackTerminalForAgent(
+  agent: AgentRecord,
+  terminals: SpawnedTerminalRegistry,
+): Promise<void> {
+  if (terminals.get(agent.persona)) {
+    return;
+  }
+
+  const lookup = await findTerminalByPid(agent.pid);
+  if (lookup.terminal) {
+    terminals.track(agent.persona, lookup.terminal);
+  }
+}
+
+async function renameTrackedTerminalPersona(
+  previousPersona: string,
+  nextPersona: string,
+  pid: number,
+  terminals: SpawnedTerminalRegistry,
+  outputChannel: vscode.OutputChannel,
+): Promise<boolean> {
+  let terminal = terminals.get(previousPersona);
+  if (!terminal) {
+    const lookup = await findTerminalByPid(pid);
+    if (lookup.terminal) {
+      terminals.track(previousPersona, lookup.terminal);
+      terminal = lookup.terminal;
+    }
+  }
+
+  const tracked = terminals.renamePersona(previousPersona, nextPersona);
+  if (!terminal) {
+    return tracked;
+  }
+
+  try {
+    terminal.show(true);
+    await vscode.commands.executeCommand('workbench.action.terminal.renameWithArg', {
+      name: nextPersona,
+    });
+  } catch (error) {
+    const message = error instanceof Error ? error.message : String(error);
+    outputChannel.appendLine(
+      `[agent-comms] failed to rename terminal for ${previousPersona} -> ${nextPersona}: ${message}`,
+    );
+  }
+
+  return true;
+}
+
+function buildActiveAgentPromptInput(
+  target: string,
+  sender: string,
+  message: ParsedSlackMessage,
+): string {
+  const task = message.taskId ? ` Task: ${message.taskId}.` : '';
+  return `Agent Comms ping from ${sender} to ${target}.${task} Stop and check Slack now with agent_comms_read_slack, then acknowledge or reply if needed. If you are already handling this ping, ignore this duplicate.`;
+}
+
+async function promptTrackedAgentTerminal(
+  targetAgent: AgentRecord,
+  sender: string,
+  message: ParsedSlackMessage,
+  terminals: SpawnedTerminalRegistry,
+  outputChannel: vscode.OutputChannel,
+): Promise<boolean> {
+  let terminal = terminals.get(targetAgent.persona);
+  let lookup: TerminalLookupResult | undefined;
+  if (!terminal) {
+    lookup = await findTerminalByPid(targetAgent.pid);
+    if (lookup.terminal) {
+      terminals.track(targetAgent.persona, lookup.terminal);
+      terminal = lookup.terminal;
+    }
+  }
+
+  if (!terminal?.sendText) {
+    if (!lookup) {
+      lookup = await findTerminalByPid(targetAgent.pid);
+    }
+    outputChannel.appendLine(
+      `[agent-comms] could not inject Agent Comms ping prompt for ${targetAgent.persona}; `
+      + `no tracked terminal input path; target=${lookup.targetDebug}; terminals=${lookup.terminalsDebug}`,
+    );
+    return false;
+  }
+
+  try {
+    await sendTerminalEscape(terminal);
+    await new Promise((resolve) => setTimeout(resolve, 50));
+    terminal.sendText(buildActiveAgentPromptInput(targetAgent.persona, sender, message), false);
+    await new Promise((resolve) => setTimeout(resolve, 50));
+    await sendTerminalEnter(terminal);
+    const matchMode = lookup?.matchedBy ? ` via ${lookup.matchedBy}` : '';
+    outputChannel.appendLine(`[agent-comms] interrupted and injected Agent Comms ping prompt into terminal for ${targetAgent.persona}${matchMode}`);
+    return true;
+  } catch (error) {
+    const messageText = error instanceof Error ? error.message : String(error);
+    outputChannel.appendLine(`[agent-comms] failed to inject Agent Comms ping prompt for ${targetAgent.persona}: ${messageText}`);
+    return false;
+  }
+}
+
+function summarizeItems<T>(label: string, items: T[], formatter: (item: T) => string): string {
+  return `${label}: ${items.length > 0 ? items.map(formatter).join(', ') : 'none'}`;
+}
+
+function formatAgentState(agent: AgentRecord): string {
+  if (agent.status === 'idle') {
+    return 'idle';
+  }
+
+  return agent.activity;
+}
+
+function formatProfilesSnapshot(
+  registry: AgentRegistry,
+  profileStore: AgentProfileStore,
+): string {
+  registry.releaseExpired();
+  const allAgents = registry.listAll();
+  const liveActive = allAgents.filter((agent) => !agent.disconnectDeadlineAt && agent.status === 'active');
+  const liveIdle = allAgents.filter((agent) => !agent.disconnectDeadlineAt && agent.status === 'idle');
+  const disconnected = allAgents.filter((agent) => agent.disconnectDeadlineAt);
+  const reservations = registry.listReservations();
+  const savedProfiles = profileStore.list();
+
+  return [
+    'Profiles snapshot:',
+    summarizeItems('Live active', liveActive, (agent) => `${agent.persona} [${formatAgentState(agent)}]${agent.registrationRequired ? ' [re-register]' : ''}${agent.taskId ? ` [task:${agent.taskId}]` : ''}`),
+    summarizeItems('Live idle', liveIdle, (agent) => `${agent.persona} [${formatAgentState(agent)}]${agent.registrationRequired ? ' [re-register]' : ''}${agent.taskId ? ` [task:${agent.taskId}]` : ''}`),
+    summarizeItems('Disconnected grace', disconnected, (agent) => agent.persona),
+    summarizeItems('Pending reservations', reservations, (reservation) => reservation.taskId ? `${reservation.persona} [task:${reservation.taskId}]` : reservation.persona),
+    summarizeItems('Saved profiles', savedProfiles, (profile) => `${profile.persona} [id:${profile.profileId.slice(0, 8)}]`),
+    summarizeItems('Invalidated profile ids', profileStore.listInvalidatedProfileIds(), (profileId) => profileId.slice(0, 8)),
+  ].join('\n');
+}
+
+async function clearSpecificPersona(
+  persona: string,
+  registry: AgentRegistry,
+  terminals: SpawnedTerminalRegistry,
+  profileStore: AgentProfileStore,
+  outputChannel: vscode.OutputChannel,
+): Promise<string> {
+  registry.releaseExpired();
+  const liveAgent = registry.get(persona);
+  const reservationReleased = registry.releaseReservation(persona);
+  const savedProfilesRemoved = await profileStore.deletePersona(persona);
+  const trackedTerminal = terminals.get(persona);
+  let terminalDisposed = false;
+  let sessionDropped = false;
+
+  if (trackedTerminal) {
+    terminalDisposed = terminals.disposeTracked(persona);
+  }
+
+  if (liveAgent) {
+    try {
+      liveAgent.socket.close(4000, 'profile_cleared');
+    } catch (error) {
+      const message = error instanceof Error ? error.message : String(error);
+      outputChannel.appendLine(`[agent-comms] failed to close socket for ${persona}: ${message}`);
+    }
+    registry.dropImmediately(persona);
+    sessionDropped = true;
+  }
+
+  if (!reservationReleased && savedProfilesRemoved === 0 && !sessionDropped) {
+    return `No saved, reserved, or live profile matched ${persona}. Run \`@Agent Comms see profiles\` first to inspect the current occupancy.`;
+  }
+
+  return [
+    `Cleared ${persona}.`,
+    `Saved profiles removed: ${savedProfilesRemoved}.`,
+    `Pending reservations released: ${reservationReleased ? 1 : 0}.`,
+    `Live sessions dropped: ${sessionDropped ? 1 : 0}.`,
+    `Tracked terminal disposed: ${terminalDisposed ? 'yes' : 'no'}.`,
+  ].join(' ');
+}
+
+async function invalidateAllProfiles(
+  registry: AgentRegistry,
+  terminals: SpawnedTerminalRegistry,
+  wsGateway: WsGateway,
+  profileStore: AgentProfileStore,
+  outputChannel: vscode.OutputChannel,
+): Promise<string> {
+  registry.releaseExpired();
+  const profileIdsToInvalidate = new Set<string>();
+  for (const profile of profileStore.list()) {
+    profileIdsToInvalidate.add(profile.profileId);
+  }
+  for (const reservation of registry.listReservations()) {
+    profileIdsToInvalidate.add(reservation.profileId);
+  }
+  for (const agent of registry.listAll()) {
+    if (agent.profileId) {
+      profileIdsToInvalidate.add(agent.profileId);
+    }
+  }
+
+  const savedProfilesCleared = await profileStore.clear();
+  const invalidatedProfileCount = await profileStore.invalidateProfileIds([...profileIdsToInvalidate]);
+  const releasedReservations = registry.listReservations()
+    .map((reservation) => reservation.persona)
+    .filter((persona) => registry.releaseReservation(persona));
+  const droppedDisconnected = registry.listAll()
+    .filter((agent) => agent.disconnectDeadlineAt)
+    .map((agent) => agent.persona);
+  for (const persona of droppedDisconnected) {
+    registry.dropImmediately(persona);
+  }
+
+  const invalidatedLive: string[] = [];
+  for (const liveAgent of registry.list()) {
+    const invalidated = registry.invalidateRegistration(liveAgent.persona);
+    await renameTrackedTerminalPersona(
+      invalidated.previousPersona,
+      invalidated.agent.persona,
+      invalidated.agent.pid,
+      terminals,
+      outputChannel,
+    );
+    wsGateway.resetSessionProfile(invalidated.agent, invalidated.previousPersona);
+    invalidatedLive.push(`${invalidated.previousPersona} -> ${invalidated.agent.persona}`);
+  }
+
+  return [
+    'Profile invalidation complete.',
+    `Saved profiles cleared: ${savedProfilesCleared}.`,
+    `Profile ids invalidated: ${invalidatedProfileCount}.`,
+    `Pending reservations released: ${releasedReservations.length}.`,
+    `Disconnected grace occupants dropped: ${droppedDisconnected.length}.`,
+    `Live agents forced to re-register: ${invalidatedLive.length > 0 ? invalidatedLive.join(', ') : 'none'}.`,
+  ].join(' ');
+}
+
+function clearDisconnectedProfiles(
+  registry: AgentRegistry,
+): string {
+  registry.releaseExpired();
+  const disconnected = registry.listAll()
+    .filter((agent) => agent.disconnectDeadlineAt)
+    .map((agent) => agent.persona);
+  for (const persona of disconnected) {
+    registry.dropImmediately(persona);
+  }
+
+  return `Disconnected profiles cleared: ${disconnected.length > 0 ? disconnected.join(', ') : 'none'}.`;
+}
+
+async function clearInvalidatedAndTemporaryProfiles(
+  registry: AgentRegistry,
+  profileStore: AgentProfileStore,
+): Promise<string> {
+  registry.releaseExpired();
+
+  const invalidatedProfileIds = profileStore.listInvalidatedProfileIds();
+  await profileStore.clearInvalidatedProfileIds(invalidatedProfileIds);
+
+  const savedUnregistered = profileStore.list()
+    .filter((profile) => profile.persona.startsWith('unregistered-'))
+    .map((profile) => profile.persona);
+  let savedUnregisteredRemoved = 0;
+  for (const persona of savedUnregistered) {
+    savedUnregisteredRemoved += await profileStore.deletePersona(persona);
+  }
+
+  const releasedReservations = registry.listReservations()
+    .filter((reservation) => reservation.persona.startsWith('unregistered-'))
+    .map((reservation) => reservation.persona)
+    .filter((persona) => registry.releaseReservation(persona));
+
+  const droppedDisconnected = registry.listAll()
+    .filter((agent) => agent.disconnectDeadlineAt && agent.persona.startsWith('unregistered-'))
+    .map((agent) => agent.persona);
+  for (const persona of droppedDisconnected) {
+    registry.dropImmediately(persona);
+  }
+
+  const stillLive = registry.list()
+    .filter((agent) => agent.persona.startsWith('unregistered-'))
+    .map((agent) => agent.persona);
+
+  return [
+    'Invalidated cleanup complete.',
+    `Invalidated profile ids cleared: ${invalidatedProfileIds.length}.`,
+    `Saved unregistered profiles removed: ${savedUnregisteredRemoved}.`,
+    `Unregistered reservations released: ${releasedReservations.length}.`,
+    `Disconnected unregistered profiles dropped: ${droppedDisconnected.length}.`,
+    `Still live unregistered sessions: ${stillLive.length > 0 ? stillLive.join(', ') : 'none'}.`,
+  ].join(' ');
 }
 
 async function interruptOrKillLiveAgents(
@@ -303,8 +699,53 @@ function buildHumanControlAck(
   return `${affectedLine}${untrackedLine}`;
 }
 
+function extractHumanRelayRecipients(text: string): string[] {
+  const matches = text.matchAll(/(?:^|[\s(])@(?<recipient>(?:ALL|NICK|[a-z0-9][a-z0-9-]{1,63}))(?=$|[\s,.:;!?)])/gimu);
+  const recipients = new Set<string>();
+  for (const match of matches) {
+    const raw = match.groups?.recipient;
+    if (!raw) {
+      continue;
+    }
+
+    const upper = raw.toUpperCase();
+    recipients.add(upper === 'ALL' || upper === 'NICK' ? upper : raw.toLowerCase());
+  }
+
+  return [...recipients];
+}
+
+function buildHumanRelayMessageForRecipients(text: string, recipients: string[]): ParsedSlackMessage | null {
+  const stripped = stripSlackUserMentions(text);
+  if (!stripped || recipients.length === 0) {
+    return null;
+  }
+
+  return parsedSlackMessageSchema.parse({
+    from: 'NICK',
+    recipients,
+    body: stripped,
+    asks: [],
+  });
+}
+
 function resolveLiveRecipient(recipient: string, livePersonas: string[]): string | null {
   return resolveRecipientAlias(recipient, livePersonas);
+}
+
+function resolveOutboundSenderPersona(payloadPersona: string, bodyPersona: string, livePersonas: string[]): string {
+  const resolvedPayloadPersona = resolveLiveRecipient(payloadPersona, livePersonas) ?? payloadPersona;
+  const resolvedBodyPersona = resolveLiveRecipient(bodyPersona, livePersonas) ?? bodyPersona;
+  if (resolvedBodyPersona !== resolvedPayloadPersona) {
+    throw createRouteError('schema_invalid', 'Body sender does not match outbound persona', {
+      bodyFrom: bodyPersona,
+      persona: payloadPersona,
+      resolvedBodyFrom: resolvedBodyPersona,
+      resolvedPersona: resolvedPayloadPersona,
+    });
+  }
+
+  return resolvedPayloadPersona;
 }
 
 function resolveEventTargets(
@@ -343,31 +784,65 @@ function resolveEventTargets(
   return { targets: [...targets], unknownRecipients };
 }
 
+function buildActiveAgentAttentionNotice(
+  target: string,
+  sender: string,
+  message: ParsedSlackMessage,
+): string {
+  const task = message.taskId ? ` (${message.taskId})` : '';
+  return `Agent Comms: ${sender} pinged ${target}${task}.`;
+}
+
+function buildDeliveryTraceSummary(options: {
+  deliveryId: string;
+  sender: string;
+  target: string;
+  slackTs: string;
+  taskId?: string;
+}): string {
+  return `delivery=${options.deliveryId} ${options.sender}->${options.target} slack_ts=${options.slackTs}${options.taskId ? ` task=${options.taskId}` : ''}`;
+}
+
+function formatEventAckSummary(ack: Awaited<ReturnType<WsGateway['waitForEventAck']>>): string {
+  if (!ack) {
+    return 'bridge_ack=timeout';
+  }
+
+  const action = ack.surface_action ? ` action=${ack.surface_action}` : '';
+  const handling = ack.surface_handling ? ` handling=${ack.surface_handling}` : '';
+  const summary = ack.surface_summary ? ` summary=${JSON.stringify(ack.surface_summary)}` : '';
+  const elapsedMs = ack.surface_elapsed_ms != null ? ` elapsed_ms=${ack.surface_elapsed_ms}` : '';
+  return `bridge_ack=${ack.surface_mechanism}:${ack.surface_status}${action}${handling}${summary}${elapsedMs} logging=${ack.logging_status}`;
+}
+
 async function handleHumanAppMention(
   event: SlackAppMentionEvent,
   registry: AgentRegistry,
   terminals: SpawnedTerminalRegistry,
+  wsGateway: WsGateway,
   slack: ReturnType<typeof createSlackBoltRuntime>,
   env: ReturnType<typeof loadAgentCommsEnv>,
   outputChannel: vscode.OutputChannel,
+  operatorControlState: OperatorControlState,
+  operatorSettingsStore: OperatorSettingsStore,
+  profileStore: AgentProfileStore,
 ): Promise<void> {
-  if (event.user !== env.SLACK_OPERATOR_USER_ID) {
-    outputChannel.appendLine(
-      `[agent-comms] ignored operator control from unauthorized Slack user ${event.user} at ${event.ts}`,
-    );
-    return;
-  }
-
-  const parsed = parseHumanSlackControl(event.text);
-  if (parsed.command === 'ignore') {
-    return;
-  }
-
-  const mode = parsed.command === 'stop_kill' ? 'kill' : 'interrupt';
-  const ack = buildHumanControlAck(
-    parsed.command === 'stop_kill' ? 'stop kill' : 'stop',
-    await interruptOrKillLiveAgents(registry, terminals, mode),
+  const ack = await handleAuthorizedHumanControl(
+    event.user,
+    event.text,
+    event.ts,
+    registry,
+    terminals,
+    wsGateway,
+    env,
+    outputChannel,
+    operatorControlState,
+    operatorSettingsStore,
+    profileStore,
   );
+  if (!ack) {
+    return;
+  }
 
   await postSlackMessage({
     client: slack.client,
@@ -377,9 +852,131 @@ async function handleHumanAppMention(
   });
 }
 
+async function handleAuthorizedHumanControl(
+  user: string,
+  text: string,
+  auditTs: string,
+  registry: AgentRegistry,
+  terminals: SpawnedTerminalRegistry,
+  wsGateway: WsGateway,
+  env: ReturnType<typeof loadAgentCommsEnv>,
+  outputChannel: vscode.OutputChannel,
+  operatorControlState: OperatorControlState,
+  operatorSettingsStore: OperatorSettingsStore,
+  profileStore: AgentProfileStore,
+): Promise<string | null> {
+  if (user !== env.SLACK_OPERATOR_USER_ID) {
+    outputChannel.appendLine(
+      `[agent-comms] ignored operator control from unauthorized Slack user ${user} at ${auditTs}`,
+    );
+    return null;
+  }
+
+  const parsed = parseHumanSlackControl(text);
+  if (parsed.command === 'ignore') {
+    return null;
+  }
+
+  switch (parsed.command) {
+    case 'stop':
+    case 'stop_kill': {
+      const mode = parsed.command === 'stop_kill' ? 'kill' : 'interrupt';
+      return buildHumanControlAck(
+        parsed.command === 'stop_kill' ? 'stop kill' : 'stop',
+        await interruptOrKillLiveAgents(registry, terminals, mode),
+      );
+    }
+    case 'listen':
+      operatorControlState.listenEnabled = true;
+      await operatorSettingsStore.setListenEnabled(true);
+      return 'LISTEN enabled. Nick channel messages now relay at high priority. Explicit `@persona` or `@ALL` routing is honored; otherwise the hub defaults to all currently active agents until you send `@Agent Comms unlisten` or `/agent-comms unlisten`.';
+    case 'unlisten':
+      operatorControlState.listenEnabled = false;
+      await operatorSettingsStore.setListenEnabled(false);
+      return 'LISTEN disabled. Human Slack messages are back to ignore-only mode except for `stop` and `stop kill`.';
+    case 'clear_profiles': {
+      operatorControlState.clearProfilesAwaitingConfirm = 'safe';
+      return `${formatProfilesSnapshot(registry, profileStore)}\n\nReply with \`@Agent Comms clear profiles confirm\` or run \`/agent-comms clear profiles confirm\` to erase saved profiles, pending reservations, and disconnected grace-period occupants. Active live agents are left alone and can be removed individually with \`clear profile <persona>\`.`;
+    }
+    case 'clear_profiles_confirm': {
+      if (operatorControlState.clearProfilesAwaitingConfirm !== 'safe') {
+        return 'No profile-clear request is pending. Send `@Agent Comms clear profiles` or `/agent-comms clear profiles` first if you want a confirmation prompt.';
+      }
+
+      operatorControlState.clearProfilesAwaitingConfirm = null;
+      const savedProfilesCleared = await profileStore.clear();
+      const releasedReservations = registry.listReservations()
+        .map((reservation) => reservation.persona)
+        .filter((persona) => registry.releaseReservation(persona));
+      const droppedDisconnected = registry.listAll()
+        .filter((agent) => agent.disconnectDeadlineAt)
+        .map((agent) => agent.persona);
+      for (const persona of droppedDisconnected) {
+        registry.dropImmediately(persona);
+      }
+      const stillLive = registry.list().map((agent) => agent.persona);
+      return [
+        'Profile reset complete.',
+        `Saved profiles cleared: ${savedProfilesCleared}.`,
+        `Pending reservations released: ${releasedReservations.length}.`,
+        `Disconnected grace occupants dropped: ${droppedDisconnected.length}.`,
+        `Still live and occupying names: ${stillLive.length > 0 ? stillLive.join(', ') : 'none'}.`,
+      ].join(' ');
+    }
+    case 'clear_profiles_all': {
+      operatorControlState.clearProfilesAwaitingConfirm = 'all';
+      return `${formatProfilesSnapshot(registry, profileStore)}\n\nReply with \`@Agent Comms clear profiles all confirm\` or run \`/agent-comms clear profiles all confirm\` to invalidate every profile id, including live connected agents, without killing terminals. Live agents will be renamed to temporary \`unregistered-*\` personas and must re-register before their next Slack send.`;
+    }
+    case 'clear_profiles_all_confirm': {
+      if (operatorControlState.clearProfilesAwaitingConfirm !== 'all') {
+        return 'No all-profile invalidation request is pending. Send `@Agent Comms clear profiles all` or `/agent-comms clear profiles all` first if you want to force every agent to re-register.';
+      }
+
+      operatorControlState.clearProfilesAwaitingConfirm = null;
+      return invalidateAllProfiles(registry, terminals, wsGateway, profileStore, outputChannel);
+    }
+    case 'see_profiles':
+      return formatProfilesSnapshot(registry, profileStore);
+    case 'clear_disconnected':
+      return clearDisconnectedProfiles(registry);
+    case 'clear_invalidated':
+      return clearInvalidatedAndTemporaryProfiles(registry, profileStore);
+    case 'clear_profile':
+      return clearSpecificPersona(parsed.persona, registry, terminals, profileStore, outputChannel);
+  }
+}
+
+async function handleHumanSlashCommand(
+  event: SlackSlashCommandEvent,
+  registry: AgentRegistry,
+  terminals: SpawnedTerminalRegistry,
+  wsGateway: WsGateway,
+  env: ReturnType<typeof loadAgentCommsEnv>,
+  outputChannel: vscode.OutputChannel,
+  operatorControlState: OperatorControlState,
+  operatorSettingsStore: OperatorSettingsStore,
+  profileStore: AgentProfileStore,
+): Promise<string> {
+  const ack = await handleAuthorizedHumanControl(
+    event.user,
+    event.text,
+    event.ts,
+    registry,
+    terminals,
+    wsGateway,
+    env,
+    outputChannel,
+    operatorControlState,
+    operatorSettingsStore,
+    profileStore,
+  );
+  return ack ?? 'Unknown Agent Comms command. Use `/agent-comms listen`, `/agent-comms unlisten`, `/agent-comms see profiles`, `/agent-comms clear disconnected`, `/agent-comms clear invalidated`, `/agent-comms clear profile <persona>`, `/agent-comms clear profiles`, `/agent-comms clear profiles confirm`, `/agent-comms clear profiles all`, `/agent-comms clear profiles all confirm`, `/agent-comms stop`, or `/agent-comms stop kill`.';
+}
+
 async function handleInboundAgentMessage(
   event: SlackChannelMessageEvent,
   registry: AgentRegistry,
+  terminals: SpawnedTerminalRegistry,
   wsGateway: WsGateway,
   outputChannel: vscode.OutputChannel,
   recentlyDeliveredSlackTs: RecentlyDeliveredSlackTs,
@@ -407,6 +1004,52 @@ async function handleInboundAgentMessage(
       threadTs: event.thread_ts ?? event.ts,
     },
     registry,
+    terminals,
+    wsGateway,
+    outputChannel,
+    logger,
+  );
+}
+
+async function handleHumanChannelMessage(
+  event: SlackChannelMessageEvent,
+  env: ReturnType<typeof loadAgentCommsEnv>,
+  operatorControlState: OperatorControlState,
+  registry: AgentRegistry,
+  terminals: SpawnedTerminalRegistry,
+  wsGateway: WsGateway,
+  outputChannel: vscode.OutputChannel,
+  recentlyDeliveredSlackTs: RecentlyDeliveredSlackTs,
+  logger?: Logger,
+): Promise<void> {
+  if (event.user !== env.SLACK_OPERATOR_USER_ID || !operatorControlState.listenEnabled) {
+    return;
+  }
+
+  if (recentlyDeliveredSlackTs.has(event.ts)) {
+    return;
+  }
+
+  const mentionedRecipients = extractHumanRelayRecipients(event.text);
+  const activeRecipients = registry.list()
+    .filter((agent) => agent.status === 'active')
+    .map((agent) => agent.persona);
+  const relayMessage = buildHumanRelayMessageForRecipients(
+    event.text,
+    mentionedRecipients.length > 0 ? mentionedRecipients : activeRecipients,
+  );
+  if (!relayMessage) {
+    return;
+  }
+
+  await deliverParsedAgentMessage(
+    relayMessage,
+    {
+      slackTs: event.ts,
+      threadTs: event.thread_ts ?? event.ts,
+    },
+    registry,
+    terminals,
     wsGateway,
     outputChannel,
     logger,
@@ -420,17 +1063,28 @@ async function deliverParsedAgentMessage(
     threadTs: string;
   },
   registry: AgentRegistry,
+  terminals: SpawnedTerminalRegistry,
   wsGateway: WsGateway,
   outputChannel: vscode.OutputChannel,
   logger?: Logger,
 ): Promise<void> {
   const sender = message.from;
+  const requiresImmediateAttention = sender === 'NICK';
   const { targets } = resolveEventTargets(registry, message.recipients, sender);
-  for (const target of targets) {
+  await Promise.allSettled(targets.map(async (target) => {
+    const deliveryId = randomUUID();
     const targetAgent = registry.get(target);
     const wasIdle = targetAgent?.status === 'idle';
+    const traceSummary = buildDeliveryTraceSummary({
+      deliveryId,
+      sender,
+      target,
+      slackTs: eventMeta.slackTs,
+      taskId: message.taskId,
+    });
     const delivered = wsGateway.sendEvent({
       type: 'event',
+      delivery_id: deliveryId,
       from_persona: sender,
       to_persona: target,
       thread_ts: eventMeta.threadTs,
@@ -441,27 +1095,67 @@ async function deliverParsedAgentMessage(
     });
 
     if (!delivered) {
-      outputChannel.appendLine(`[agent-comms] local delivery skipped for ${target} at ${eventMeta.slackTs}`);
-      continue;
+      outputChannel.appendLine(`[agent-comms] ${traceSummary} local delivery skipped before bridge receipt`);
+      return;
     }
 
-    if (!targetAgent || !wasIdle) {
-      continue;
+    outputChannel.appendLine(`[agent-comms] ${traceSummary} ws event delivered to live bridge socket`);
+
+    if (!targetAgent) {
+      return;
     }
 
+    registry.noteInboundMessage(target, {
+      fromPersona: sender,
+      urgent: requiresImmediateAttention,
+      receivedAt: new Date().toISOString(),
+      taskId: message.taskId,
+      threadTs: eventMeta.threadTs,
+    });
+
+    if (!wasIdle && targetAgent.activity === 'working') {
+      const eventAck = await wsGateway.waitForEventAck(deliveryId, 250);
+      const prompted = targetAgent.kind === 'codex'
+        ? await promptTrackedAgentTerminal(targetAgent, sender, message, terminals, outputChannel)
+        : false;
+      void vscode.window.showInformationMessage(buildActiveAgentAttentionNotice(target, sender, message));
+      outputChannel.appendLine(
+        requiresImmediateAttention
+          ? `[agent-comms] ${traceSummary} high-priority active-working branch ${formatEventAckSummary(eventAck)}${prompted ? ' prompt=ok' : ' prompt=skip'}`
+          : `[agent-comms] ${traceSummary} active-working branch ${formatEventAckSummary(eventAck)}${prompted ? ' prompt=ok' : ' prompt=skip'}`,
+      );
+      return;
+    }
+
+    if (!wasIdle) {
+      const eventAck = await wsGateway.waitForEventAck(deliveryId, 800);
+      const prompted = targetAgent.kind === 'codex'
+        ? await promptTrackedAgentTerminal(targetAgent, sender, message, terminals, outputChannel)
+        : false;
+      void vscode.window.showInformationMessage(buildActiveAgentAttentionNotice(target, sender, message));
+      outputChannel.appendLine(
+        `[agent-comms] ${traceSummary} active-waiting branch ${formatEventAckSummary(eventAck)}${prompted ? ' prompt=ok' : targetAgent.kind === 'codex' ? ' prompt=skip' : ''}`,
+      );
+      return;
+    }
+
+    const eventAck = await wsGateway.waitForEventAck(deliveryId, 800);
     registry.markResume(target, message.taskId);
-    const woke = await wakeProcessTty(targetAgent.pid, { logger });
+    const prompted = targetAgent.kind === 'codex'
+      ? await promptTrackedAgentTerminal(targetAgent, sender, message, terminals, outputChannel)
+      : false;
+    void vscode.window.showInformationMessage(buildActiveAgentAttentionNotice(target, sender, message));
     outputChannel.appendLine(
-      woke
-        ? `[agent-comms] woke idle agent ${target} after inbound delivery`
-        : `[agent-comms] delivered inbound message to idle agent ${target}, but tty wake failed`,
+      `[agent-comms] ${traceSummary} idle branch ${formatEventAckSummary(eventAck)} resume=ok${prompted ? ' prompt=ok' : targetAgent.kind === 'codex' ? ' prompt=skip' : ''}`,
     );
-  }
+  }));
 }
 
 async function handleOutboundRequest(
   payload: OutboundRequest,
   registry: AgentRegistry,
+  terminals: SpawnedTerminalRegistry,
+  profileStore: AgentProfileStore,
   slack: ReturnType<typeof createSlackBoltRuntime>,
   env: ReturnType<typeof loadAgentCommsEnv>,
   wsGateway: WsGateway,
@@ -472,18 +1166,16 @@ async function handleOutboundRequest(
 ): Promise<PostedSlackMessage> {
   const validation = validateSlackMessageText(payload.body);
   if (!validation.ok) {
+    logger?.warn(
+      { persona: payload.persona, taskId: payload.task_id, bodyLength: payload.body.length, parseError: validation.error.message },
+      'outbound body failed schema validation',
+    );
     throw createRouteError('schema_invalid', 'Outbound Slack body failed validation', validation.error.message);
   }
 
   const parsedBody = validation.data;
-  if (parsedBody.from !== payload.persona) {
-    throw createRouteError('schema_invalid', 'Body sender does not match outbound persona', {
-      bodyFrom: parsedBody.from,
-      persona: payload.persona,
-    });
-  }
-
   const livePersonas = registry.list().map((agent) => agent.persona);
+  const senderPersona = resolveOutboundSenderPersona(payload.persona, parsedBody.from, livePersonas);
   const unknownRecipients = parsedBody.recipients.filter((recipient) => {
     if (recipient === 'ALL' || recipient === 'NICK') {
       return false;
@@ -498,15 +1190,23 @@ async function handleOutboundRequest(
     });
   }
 
-  const senderKind = registry.get(payload.persona)?.kind ?? parseAutomaticPersona(payload.persona)?.kind;
+  const senderAgent = registry.get(senderPersona);
+  if (senderAgent?.registrationRequired) {
+    throw createRouteError(
+      'schema_invalid',
+      'Persona must be re-registered before sending Slack messages',
+      { persona: senderPersona },
+    );
+  }
+  const senderKind = senderAgent?.kind ?? parseAutomaticPersona(senderPersona)?.kind;
   if (!senderKind) {
-    throw createRouteError('schema_invalid', 'Unable to resolve sender kind', { persona: payload.persona });
+    throw createRouteError('schema_invalid', 'Unable to resolve sender kind', { persona: senderPersona });
   }
 
   const posted = await postPersonaMessage({
     client: slack.client,
     channel: env.SLACK_CHANNEL_ID,
-    persona: payload.persona,
+    persona: senderPersona,
     kind: senderKind,
     text: payload.body,
     threadTs: payload.thread_ts ?? null,
@@ -515,6 +1215,16 @@ async function handleOutboundRequest(
     iconUrl: slackIconsBaseUrl ? undefined : null,
   });
 
+  await profileStore.noteAgent({
+    profileId: senderAgent?.profileId,
+    persona: senderPersona,
+    kind: senderKind,
+    cwd: senderAgent?.cwd ?? '',
+    taskId: payload.task_id,
+  });
+  if (senderAgent) {
+    registry.clearPendingMessages(senderPersona);
+  }
   recentlyDeliveredSlackTs.note(posted.slackTs);
   await deliverParsedAgentMessage(
     parsedBody,
@@ -523,6 +1233,7 @@ async function handleOutboundRequest(
       threadTs: posted.threadTs,
     },
     registry,
+    terminals,
     wsGateway,
     outputChannel,
     logger,
@@ -590,6 +1301,8 @@ async function handleRenameRequest(
   registry: AgentRegistry,
   terminals: SpawnedTerminalRegistry,
   wsGateway: WsGateway,
+  profileStore: AgentProfileStore,
+  outputChannel: vscode.OutputChannel,
 ): Promise<{ persona: string; previous_persona: string }> {
   const renamed = registry.rename({
     persona: request.persona,
@@ -599,19 +1312,44 @@ async function handleRenameRequest(
     instanceNumber: request.instance_number ?? null,
   });
 
-  terminals.renamePersona(renamed.previousPersona, renamed.agent.persona);
+  await renameTrackedTerminalPersona(
+    renamed.previousPersona,
+    renamed.agent.persona,
+    renamed.agent.pid,
+    terminals,
+    outputChannel,
+  );
   wsGateway.renameSessionPersona(renamed.agent.socket, renamed.previousPersona, renamed.agent.persona);
+  await profileStore.noteAgent({
+    profileId: renamed.agent.profileId,
+    persona: renamed.agent.persona,
+    kind: renamed.agent.kind,
+    cwd: renamed.agent.cwd,
+    taskId: renamed.agent.taskId ?? null,
+  });
   return {
     persona: renamed.agent.persona,
     previous_persona: renamed.previousPersona,
   };
 }
 
-export async function bootstrap(context: vscode.ExtensionContext): Promise<AgentCommsRuntime> {
+function describeFault(error: unknown): string {
+  if (error instanceof Error) {
+    return error.stack ?? error.message;
+  }
+
+  return String(error);
+}
+
+export async function bootstrap(
+  context: vscode.ExtensionContext,
+  options: BootstrapOptions = {},
+): Promise<AgentCommsRuntime> {
   const workspaceRoot = getPrimaryWorkspaceRoot();
   await ensureGlobalBridgeLaunchers(context.extensionPath);
 
-  const outputChannel = vscode.window.createOutputChannel('Agent Comms');
+  const outputChannel = options.outputChannel ?? vscode.window.createOutputChannel('Agent Comms');
+  const ownOutputChannel = !options.outputChannel;
   const configuration = vscode.workspace.getConfiguration('agentComms');
   const env = loadAgentCommsEnv({
     envFilePath: configuration.get<string>('envFilePath'),
@@ -623,11 +1361,32 @@ export async function bootstrap(context: vscode.ExtensionContext): Promise<Agent
   const logger = createLogger({
     level: env.LOG_LEVEL,
     pretty: false,
+    logFilePrefix: 'hub',
   });
+  const reportFault = (source: string, error: unknown, showNotification = true): void => {
+    const message = describeFault(error);
+    outputChannel.appendLine(`[agent-comms][${source}] ${message}`);
+    if (showNotification) {
+      void vscode.window.showWarningMessage(`Agent Comms issue (${source}). Check the "Agent Comms" output channel.`);
+    }
+    options.onFault?.({ source, error, message });
+  };
 
   const registry = new AgentRegistry({ logger });
+  const profileStore = new AgentProfileStore(context.globalState);
+  const operatorSettingsStore = new OperatorSettingsStore(context.globalState);
   const terminals = new SpawnedTerminalRegistry();
   const recentlyDeliveredSlackTs = new RecentlyDeliveredSlackTs();
+  const savedOperatorSettings = operatorSettingsStore.get();
+  const operatorControlState: OperatorControlState = {
+    listenEnabled: savedOperatorSettings.listenEnabled,
+    clearProfilesAwaitingConfirm: null,
+  };
+  outputChannel.appendLine(`[agent-comms] booting hub for ${workspaceRoot} on port ${env.EXTENSION_PORT}`);
+  outputChannel.appendLine(`[agent-comms] persistent logs: ${resolveAgentCommsLogDir()}`);
+  if (operatorControlState.listenEnabled) {
+    outputChannel.appendLine('[agent-comms] restored operator listen mode from saved state');
+  }
   context.subscriptions.push(
     vscode.window.onDidCloseTerminal((terminal) => {
       terminals.untrackTerminal(terminal);
@@ -641,6 +1400,7 @@ export async function bootstrap(context: vscode.ExtensionContext): Promise<Agent
     iconsDir: path.resolve(context.extensionPath, 'icons'),
     registry,
     logger,
+    onFault: (source, error) => reportFault(source, error, false),
     onSpawn: async (request) =>
       spawnAgent(request, {
         registry,
@@ -656,6 +1416,8 @@ export async function bootstrap(context: vscode.ExtensionContext): Promise<Agent
     onOutbound: async (request) => handleOutboundRequest(
       request,
       registry,
+      terminals,
+      profileStore,
       slackRuntime,
       env,
       wsGateway,
@@ -665,7 +1427,7 @@ export async function bootstrap(context: vscode.ExtensionContext): Promise<Agent
       slackIconsBaseUrl,
     ),
     onReadSlack: async (request) => handleReadSlackHistory(slackRuntime, env, request),
-    onRename: async (request) => handleRenameRequest(request, registry, terminals, wsGateway),
+    onRename: async (request) => handleRenameRequest(request, registry, terminals, wsGateway, profileStore, outputChannel),
   });
 
   wsGateway = new WsGateway({
@@ -674,9 +1436,15 @@ export async function bootstrap(context: vscode.ExtensionContext): Promise<Agent
     registry,
     logger,
     iconsBaseUrl: localIconsBaseUrl,
+    onFault: (source, error) => reportFault(source, error, false),
+    resolveSavedPersona: (profileId) => profileStore.get(profileId)?.persona,
+    isProfileInvalidated: (profileId) => profileStore.isProfileInvalidated(profileId),
+    onAgentConnected: async (agent) => trackTerminalForAgent(agent, terminals),
     onOutbound: async (request) => handleOutboundRequest(
       request,
       registry,
+      terminals,
+      profileStore,
       slackRuntime,
       env,
       wsGateway,
@@ -685,31 +1453,72 @@ export async function bootstrap(context: vscode.ExtensionContext): Promise<Agent
       logger,
       slackIconsBaseUrl,
     ),
-    onAgentConnected: async (agent) => announceAgentOnline(slackRuntime, env, agent, slackIconsBaseUrl),
   });
 
   slackRuntime = createSlackBoltRuntime({
     env,
     logger,
-    onAppMention: async (event) => handleHumanAppMention(event, registry, terminals, slackRuntime, env, outputChannel),
+    onFault: (source, error) => reportFault(source, error, false),
+    onAppMention: async (event) => handleHumanAppMention(
+      event,
+      registry,
+      terminals,
+      wsGateway,
+      slackRuntime,
+      env,
+      outputChannel,
+      operatorControlState,
+      operatorSettingsStore,
+      profileStore,
+    ),
     onChannelMessage: async (event) => handleInboundAgentMessage(
       event,
       registry,
+      terminals,
       wsGateway,
       outputChannel,
       recentlyDeliveredSlackTs,
       logger,
     ),
+    onHumanChannelMessage: async (event) => handleHumanChannelMessage(
+      event,
+      env,
+      operatorControlState,
+      registry,
+      terminals,
+      wsGateway,
+      outputChannel,
+      recentlyDeliveredSlackTs,
+      logger,
+    ),
+    onSlashCommand: async (event) => handleHumanSlashCommand(
+      event,
+      registry,
+      terminals,
+      wsGateway,
+      env,
+      outputChannel,
+      operatorControlState,
+      operatorSettingsStore,
+      profileStore,
+    ),
   });
 
-  await httpGateway.start();
-  wsGateway.start();
-  await slackRuntime.start();
+  try {
+    await httpGateway.start();
+    wsGateway.start();
+    await slackRuntime.start();
+    outputChannel.appendLine(`[agent-comms] hub ready on 127.0.0.1:${env.EXTENSION_PORT}`);
+  } catch (error) {
+    reportFault('runtime.start', error, true);
+    throw error;
+  }
 
   return new AgentCommsRuntimeImpl(
     context,
     workspaceRoot,
     outputChannel,
+    ownOutputChannel,
     env,
     registry,
     terminals,

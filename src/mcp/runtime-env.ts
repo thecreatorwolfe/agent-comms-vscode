@@ -8,6 +8,8 @@ export interface AgentCommsBridgeEnv {
   port: number;
   secret: string;
   claimedPersona?: string;
+  profileId?: string;
+  pid?: number;
   logLevel?: AgentCommsLogLevel;
 }
 
@@ -51,6 +53,8 @@ export function resolveBridgeEnv(
   const portValue = firstDefined(env.AGENT_COMMS_PORT, env.EXTENSION_PORT, fileEnv.EXTENSION_PORT);
   const secret = firstDefined(env.ROUTER_SHARED_SECRET, fileEnv.ROUTER_SHARED_SECRET);
   const claimedPersona = firstDefined(env.AGENT_COMMS_PERSONA);
+  const profileId = firstDefined(env.AGENT_COMMS_PROFILE_ID);
+  const pidValue = firstDefined(env.AGENT_COMMS_TERMINAL_PID);
   const logLevel = coerceLogLevel(firstDefined(
     env.LOG_LEVEL as AgentCommsLogLevel | undefined,
     fileEnv.LOG_LEVEL as AgentCommsLogLevel | undefined,
@@ -69,10 +73,20 @@ export function resolveBridgeEnv(
     throw new Error('Missing ROUTER_SHARED_SECRET. Populate ~/.agent-comms/.env or export it before launch.');
   }
 
+  let pid: number | undefined;
+  if (pidValue) {
+    const parsedPid = Number(pidValue);
+    if (Number.isInteger(parsedPid) && parsedPid > 0) {
+      pid = parsedPid;
+    }
+  }
+
   return {
     port,
     secret,
     claimedPersona,
+    profileId,
+    pid,
     logLevel,
   };
 }

@@ -51,6 +51,14 @@ export interface SpawnAgentDependencies {
   logger?: Logger;
 }
 
+function hasExplicitPersonaRequest(request: SpawnRequest): boolean {
+  return Boolean(
+    request.customName?.trim()
+      || request.personaSuffix?.trim()
+      || request.instanceNumber != null,
+  );
+}
+
 function shellQuote(value: string): string {
   return `'${value.replace(/'/g, `'\\''`)}'`;
 }
@@ -71,7 +79,7 @@ export function buildSpawnCommand(
     ? ` -c ${shellQuote(`mcp_servers.chrome-devtools.startup_timeout_sec=${codexChromeDevtoolsStartupTimeoutSec}`)}`
     : '';
 
-  return `codex${chromeDevtoolsTimeoutArg} "$(cat ${quotedBrief})"`;
+  return `~/.agent-comms/bin/codex-agent-comms${chromeDevtoolsTimeoutArg} "$(cat ${quotedBrief})"`;
 }
 
 async function promptReuseExistingPersona(persona: string): Promise<boolean> {
@@ -89,6 +97,12 @@ async function promptReuseExistingPersona(persona: string): Promise<boolean> {
 export async function spawnAgent(req: SpawnRequest, dependencies: SpawnAgentDependencies): Promise<SpawnResult> {
   if (!dependencies.workspaceRoot) {
     throw new SpawnPreconditionError('No local workspace open');
+  }
+
+  if (req.parentPersona && !hasExplicitPersonaRequest(req)) {
+    throw new SpawnPreconditionError(
+      'Parent-spawned agents must be named explicitly. Provide customName, personaSuffix, or instanceNumber.',
+    );
   }
 
   const project = resolveProjectName({
@@ -142,6 +156,7 @@ export async function spawnAgent(req: SpawnRequest, dependencies: SpawnAgentDepe
       ROUTER_SHARED_SECRET: dependencies.routerSharedSecret,
       AGENT_COMMS_BRIEF_FILE: req.briefFilePath,
       AGENT_COMMS_EXTENSION_PATH: dependencies.extensionPath,
+      AGENT_COMMS_PROFILE_ID: reservation.profileId,
     },
   });
 

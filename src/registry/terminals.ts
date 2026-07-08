@@ -1,5 +1,7 @@
 export interface ManagedTerminalLike {
   readonly name: string;
+  show(preserveFocus?: boolean): void;
+  sendText?(text: string, shouldExecute?: boolean): void;
   dispose(): void;
 }
 

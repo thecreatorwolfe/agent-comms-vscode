@@ -35,6 +35,65 @@ describe('AgentCommsWsClient waitForAuth', () => {
     await expect(client.waitForAuth(5)).rejects.toThrow('reservation_missing');
   });
 
+  it('stores persona source and registration state from auth.ack', async () => {
+    const client = new AgentCommsWsClient({
+      kind: 'codex',
+      port: 47592,
+      secret: 'secret',
+      cwd: '/tmp/project',
+    }) as AgentCommsWsClient & {
+      handleIncoming: (raw: string) => Promise<void>;
+    };
+
+    await client.handleIncoming(
+      JSON.stringify({
+        type: 'auth.ack',
+        persona: 'unregistered-codex-deadbeef',
+        icon_url: 'https://example.com/icon.png',
+        persona_source: 'generated',
+        registration_required: true,
+      }),
+    );
+
+    expect(client.getConnectionSnapshot()).toMatchObject({
+      authenticated: true,
+      persona: 'unregistered-codex-deadbeef',
+      personaSource: 'generated',
+      registrationRequired: true,
+    });
+  });
+
+  it('updates the local snapshot when a live profile reset arrives', async () => {
+    const client = new AgentCommsWsClient({
+      kind: 'codex',
+      port: 47592,
+      secret: 'secret',
+      cwd: '/tmp/project',
+    }) as AgentCommsWsClient & {
+      handleIncoming: (raw: string) => Promise<void>;
+    };
+
+    client.setCurrentPersona('checkout-flow-codex-7', {
+      personaSource: 'saved',
+      registrationRequired: false,
+    });
+
+    await client.handleIncoming(
+      JSON.stringify({
+        type: 'profile.reset',
+        persona: 'unregistered-codex-deadbeef',
+        icon_url: 'https://example.com/icon.png',
+        registration_required: true,
+      }),
+    );
+
+    expect(client.getConnectionSnapshot()).toMatchObject({
+      persona: 'unregistered-codex-deadbeef',
+      personaSource: 'generated',
+      registrationRequired: true,
+    });
+  });
+
   it('resolves sendOutboundAndWait once outbound.ack arrives', async () => {
     const client = new AgentCommsWsClient({
       kind: 'codex',
@@ -143,6 +202,7 @@ describe('AgentCommsWsClient waitForAuth', () => {
         persona: 'demo-codex-1',
         task_id: 'smoke-status',
         status: 'idle',
+        activity: 'waiting',
       }),
     );
 
@@ -150,6 +210,7 @@ describe('AgentCommsWsClient waitForAuth', () => {
       persona: 'demo-codex-1',
       taskId: 'smoke-status',
       status: 'idle',
+      activity: 'waiting',
     });
   });
 
@@ -178,6 +239,7 @@ describe('AgentCommsWsClient waitForAuth', () => {
         persona: 'demo-codex-1',
         task_id: 'smoke-status',
         status: 'active',
+        activity: 'working',
       }),
     );
 
@@ -185,6 +247,7 @@ describe('AgentCommsWsClient waitForAuth', () => {
       persona: 'demo-codex-1',
       taskId: 'smoke-status',
       status: 'active',
+      activity: 'working',
     });
   });
 

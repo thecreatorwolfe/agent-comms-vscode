@@ -58,4 +58,22 @@ describe('postPersonaMessage', () => {
       }),
     );
   });
+
+  it('preserves the requested thread timestamp for thread replies', async () => {
+    const client = createClient();
+
+    const posted = await postPersonaMessage({
+      client,
+      channel: 'C123',
+      persona: 'demo-codex-2',
+      kind: 'codex',
+      text: VALID_PROTOCOL_MESSAGE,
+      threadTs: '1776177341.721089',
+    });
+
+    expect(posted).toEqual({
+      slackTs: '1776157290.950299',
+      threadTs: '1776177341.721089',
+    });
+  });
 });

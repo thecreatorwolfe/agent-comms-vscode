@@ -18,6 +18,22 @@ describe('slack parsing', () => {
     expect(parseHumanSlackControl('<@U123> stop kill')).toEqual({ command: 'stop_kill' });
   });
 
+  it('accepts listen toggles and profile-clear controls from Slack', () => {
+    expect(parseHumanSlackControl('<@U123> listen')).toEqual({ command: 'listen' });
+    expect(parseHumanSlackControl('<@U123> unlisten')).toEqual({ command: 'unlisten' });
+    expect(parseHumanSlackControl('<@U123> see profiles')).toEqual({ command: 'see_profiles' });
+    expect(parseHumanSlackControl('<@U123> clear profile security-audit-codex-1')).toEqual({
+      command: 'clear_profile',
+      persona: 'security-audit-codex-1',
+    });
+    expect(parseHumanSlackControl('<@U123> clear profiles')).toEqual({ command: 'clear_profiles' });
+    expect(parseHumanSlackControl('<@U123> clear profiles confirm')).toEqual({ command: 'clear_profiles_confirm' });
+    expect(parseHumanSlackControl('<@U123> clear profiles all')).toEqual({ command: 'clear_profiles_all' });
+    expect(parseHumanSlackControl('<@U123> clear profiles all confirm')).toEqual({ command: 'clear_profiles_all_confirm' });
+    expect(parseHumanSlackControl('<@U123> clear disconnected')).toEqual({ command: 'clear_disconnected' });
+    expect(parseHumanSlackControl('<@U123> clear invalidated')).toEqual({ command: 'clear_invalidated' });
+  });
+
   it('ignores arbitrary human instructions from Slack', () => {
     expect(parseHumanSlackControl('<@U123> @security-audit-codex-1 please review this diff')).toEqual({
       command: 'ignore',

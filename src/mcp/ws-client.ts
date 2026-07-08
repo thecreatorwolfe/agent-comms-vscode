@@ -3,6 +3,7 @@ import type { Logger } from 'pino';
 import {
   extensionToPluginFrameSchema,
   type AuthAckFrame,
+  type EventAckFrame,
   type EventFrame,
   type OutboundFrame,
 } from '../schema/frames';
@@ -15,9 +16,19 @@ export interface AgentCommsWsClientOptions {
   cwd: string;
   pid?: number;
   persona?: string;
+  profileId?: string;
   logger?: Logger;
   onAuth?: (frame: AuthAckFrame) => Promise<void> | void;
   onEvent?: (frame: EventFrame) => Promise<void> | void;
+}
+
+export interface AgentCommsWsConnectionSnapshot {
+  state: 'connecting' | 'connected' | 'reconnecting' | 'stopped';
+  persona?: string;
+  authenticated: boolean;
+  personaSource?: AuthAckFrame['persona_source'];
+  registrationRequired?: boolean;
+  lastError?: string;
 }
 
 export class AgentCommsWsClient {
@@ -36,14 +47,14 @@ export class AgentCommsWsClient {
   private pendingStandby:
     | {
       taskId: string;
-      resolve: (result: { persona: string; taskId: string; status: 'idle' }) => void;
+      resolve: (result: { persona: string; taskId: string; status: 'idle'; activity: 'waiting' }) => void;
       reject: (error: Error) => void;
       timeout: NodeJS.Timeout;
     }
     | undefined;
   private pendingResume:
     | {
-      resolve: (result: { persona: string; taskId?: string; status: 'active' }) => void;
+      resolve: (result: { persona: string; taskId?: string; status: 'active'; activity: 'working' | 'waiting' }) => void;
       reject: (error: Error) => void;
       timeout: NodeJS.Timeout;
     }
@@ -52,6 +63,11 @@ export class AgentCommsWsClient {
   private authenticated = false;
   private persona: string | undefined;
   private lastConnectionError: string | undefined;
+  private connectionState: AgentCommsWsConnectionSnapshot['state'] = 'connecting';
+  private personaSource: AuthAckFrame['persona_source'] | undefined;
+  private registrationRequired = false;
+  private hasAuthenticatedOnce = false;
+  private disconnectNoticeShown = false;
 
   constructor(options: AgentCommsWsClientOptions) {
     this.options = options;
@@ -59,11 +75,13 @@ export class AgentCommsWsClient {
   }
 
   async start(): Promise<void> {
+    this.stopped = false;
     this.connect();
   }
 
   async stop(reason = 'client_shutdown'): Promise<void> {
     this.stopped = true;
+    this.connectionState = 'stopped';
     this.stopHeartbeat();
     if (this.reconnectTimer) {
       clearTimeout(this.reconnectTimer);
@@ -85,8 +103,31 @@ export class AgentCommsWsClient {
     return this.persona;
   }
 
-  setCurrentPersona(persona: string): void {
+  setCurrentPersona(
+    persona: string,
+    options?: {
+      personaSource?: AuthAckFrame['persona_source'];
+      registrationRequired?: boolean;
+    },
+  ): void {
     this.persona = persona;
+    if (options?.personaSource) {
+      this.personaSource = options.personaSource;
+    }
+    if (typeof options?.registrationRequired === 'boolean') {
+      this.registrationRequired = options.registrationRequired;
+    }
+  }
+
+  getConnectionSnapshot(): AgentCommsWsConnectionSnapshot {
+    return {
+      state: this.connectionState,
+      persona: this.persona,
+      authenticated: this.authenticated,
+      personaSource: this.personaSource,
+      registrationRequired: this.registrationRequired,
+      lastError: this.lastConnectionError,
+    };
   }
 
   sendOutbound(frame: Omit<OutboundFrame, 'type' | 'persona'>): void {
@@ -147,7 +188,7 @@ export class AgentCommsWsClient {
   async sendStandbyAndWait(
     taskId: string,
     timeoutMs = 5_000,
-  ): Promise<{ persona: string; taskId: string; status: 'idle' }> {
+  ): Promise<{ persona: string; taskId: string; status: 'idle'; activity: 'waiting' }> {
     if (!this.persona) {
       throw new Error('Cannot send standby before auth.ack');
     }
@@ -188,10 +229,22 @@ export class AgentCommsWsClient {
     });
   }
 
+  sendEventAck(frame: Omit<EventAckFrame, 'type' | 'persona'>): void {
+    if (!this.persona) {
+      throw new Error('Cannot send event.ack before auth.ack');
+    }
+
+    this.sendJson({
+      type: 'event.ack',
+      persona: this.persona,
+      ...frame,
+    });
+  }
+
   async sendResumeAndWait(
     taskId?: string,
     timeoutMs = 5_000,
-  ): Promise<{ persona: string; taskId?: string; status: 'active' }> {
+  ): Promise<{ persona: string; taskId?: string; status: 'active'; activity: 'working' | 'waiting' }> {
     if (!this.persona) {
       throw new Error('Cannot send resume before auth.ack');
     }
@@ -234,6 +287,7 @@ export class AgentCommsWsClient {
 
   private connect(): void {
     this.lastConnectionError = undefined;
+    this.connectionState = this.hasAuthenticatedOnce ? 'reconnecting' : 'connecting';
     this.ws = new WebSocket(`ws://127.0.0.1:${this.options.port}/ws`);
 
     this.ws.on('open', () => {
@@ -242,13 +296,18 @@ export class AgentCommsWsClient {
         secret: this.options.secret,
         agent_kind: this.options.kind,
         persona: this.persona ?? '',
+        profile_id: this.options.profileId ?? null,
         pid: this.options.pid ?? process.pid,
         cwd: this.options.cwd,
       });
     });
 
     this.ws.on('message', (raw) => {
-      void this.handleIncoming(raw.toString());
+      void this.handleIncoming(raw.toString()).catch((error) => {
+        const message = error instanceof Error ? error.message : String(error);
+        this.lastConnectionError = message;
+        this.options.logger?.error({ err: error }, 'agent-comms ws message handler failed');
+      });
     });
 
     this.ws.on('close', () => {
@@ -260,12 +319,18 @@ export class AgentCommsWsClient {
         this.lastConnectionError = 'Agent Comms WebSocket closed before auth.ack';
       }
       if (!this.stopped) {
+        this.connectionState = 'reconnecting';
+        if (this.hasAuthenticatedOnce && !this.disconnectNoticeShown) {
+          this.disconnectNoticeShown = true;
+          this.options.logger?.info(`Hub connection lost. Reconnecting to 127.0.0.1:${this.options.port}.`);
+        }
         this.scheduleReconnect();
       }
     });
 
     this.ws.on('error', (error) => {
       this.lastConnectionError = error.message;
+      this.connectionState = this.stopped ? 'stopped' : 'reconnecting';
       this.options.logger?.error({ err: error }, 'agent-comms ws client error');
     });
   }
@@ -289,9 +354,17 @@ export class AgentCommsWsClient {
     switch (frame.type) {
       case 'auth.ack':
         this.authenticated = true;
+        this.connectionState = 'connected';
         this.persona = frame.persona;
+        this.personaSource = frame.persona_source;
+        this.registrationRequired = frame.registration_required;
         this.lastConnectionError = undefined;
         this.startHeartbeat();
+        if (this.hasAuthenticatedOnce || this.disconnectNoticeShown) {
+          this.options.logger?.info(`Hub connected as ${frame.persona}.`);
+        }
+        this.hasAuthenticatedOnce = true;
+        this.disconnectNoticeShown = false;
         await this.options.onAuth?.(frame);
         return;
       case 'event':
@@ -315,7 +388,16 @@ export class AgentCommsWsClient {
       }
       case 'auth.error':
         this.lastConnectionError = `Agent Comms auth failed: ${frame.reason}`;
+        this.connectionState = 'reconnecting';
         this.options.logger?.warn({ frame }, 'extension returned an auth error frame');
+        this.options.logger?.warn(`Hub auth failed: ${frame.reason}. Reconnecting.`);
+        return;
+      case 'profile.reset':
+        this.persona = frame.persona;
+        this.personaSource = 'generated';
+        this.registrationRequired = frame.registration_required;
+        this.lastConnectionError = undefined;
+        this.options.logger?.info(`Profile reset as ${frame.persona}. Re-register before the next Slack send.`);
         return;
       case 'outbound.error': {
         this.lastConnectionError = `Agent Comms outbound error: ${frame.reason}`;
@@ -340,6 +422,7 @@ export class AgentCommsWsClient {
           persona: frame.persona,
           taskId: frame.task_id,
           status: frame.status,
+          activity: frame.activity,
         });
         return;
       }
@@ -355,6 +438,7 @@ export class AgentCommsWsClient {
           persona: frame.persona,
           taskId: frame.task_id,
           status: frame.status,
+          activity: frame.activity,
         });
         return;
       }
