@@ -11,6 +11,7 @@ import {
   type SlackChannelMessageEvent,
   type SlackSlashCommandEvent,
 } from './slack/bolt';
+import { ChannelInboundPoller, CHANNEL_POLL_INTERVAL_MS } from './slack/channel-poller';
 import { parseAgentSlackEventText, parseHumanSlackControl, stripSlackUserMentions } from './slack/parse';
 import { postPersonaMessage, postSlackMessage, type PostedSlackMessage } from './slack/post';
 import { AgentRegistry, type AgentRecord } from './registry/agents';
@@ -114,6 +115,7 @@ class AgentCommsRuntimeImpl implements AgentCommsRuntime {
     private readonly slack: ReturnType<typeof createSlackBoltRuntime>,
     private readonly httpGateway: GatewayHttpServer,
     private readonly wsGateway: WsGateway,
+    private readonly channelPoller: ChannelInboundPoller,
   ) {}
 
   showRegistry(): void {
@@ -217,6 +219,7 @@ class AgentCommsRuntimeImpl implements AgentCommsRuntime {
   }
 
   async dispose(): Promise<void> {
+    this.channelPoller.stop();
     await this.wsGateway.stop();
     await this.httpGateway.stop();
     await this.slack.stop();
@@ -981,6 +984,10 @@ async function handleInboundAgentMessage(
     return;
   }
 
+  // Mark the ts processed before delivering so the Socket Mode event path and
+  // the channel poller (which both feed this function) never double-deliver the
+  // same message. Noting synchronously here closes the race between them.
+  recentlyDeliveredSlackTs.note(event.ts);
   await deliverParsedAgentMessage(
     parsed.message,
     {
@@ -1503,11 +1510,28 @@ export async function bootstrap(
     ),
   });
 
+  const channelPoller = new ChannelInboundPoller(
+    slackRuntime,
+    env.SLACK_CHANNEL_ID,
+    CHANNEL_POLL_INTERVAL_MS,
+    async (event) => handleInboundAgentMessage(
+      event,
+      registry,
+      terminals,
+      wsGateway,
+      outputChannel,
+      recentlyDeliveredSlackTs,
+      logger,
+    ),
+    logger,
+  );
+
   try {
     await httpGateway.start();
     wsGateway.start();
     await slackRuntime.start();
-    outputChannel.appendLine(`[agent-comms] hub ready on 127.0.0.1:${env.EXTENSION_PORT}`);
+    await channelPoller.start();
+    outputChannel.appendLine(`[agent-comms] hub ready on 127.0.0.1:${env.EXTENSION_PORT} (channel poller every ${CHANNEL_POLL_INTERVAL_MS}ms)`);
   } catch (error) {
     reportFault('runtime.start', error, true);
     throw error;
@@ -1524,5 +1548,6 @@ export async function bootstrap(
     slackRuntime,
     httpGateway,
     wsGateway,
+    channelPoller,
   );
 }

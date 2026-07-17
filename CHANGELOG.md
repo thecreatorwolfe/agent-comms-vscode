@@ -1,5 +1,9 @@
 # Changelog
 
+## 0.2.48
+
+- **Reliable cross-hub inbound delivery (B1, part 2):** added an active channel poller. Slack Socket Mode load-balances each realtime event across all of an app's live connections, so when the fleet shares one Slack app a message event reaches only ONE hub — often not the hub that owns the addressed persona — which left agents "not responding" with pending pings stuck at 0. The hub now also polls `conversations.history` every 5s and delivers any protocol message addressed to a locally-registered persona, de-duplicated against the realtime path so nothing is delivered twice. This makes inbound delivery deterministic regardless of which connection Slack routed the event to.
+
 ## 0.2.47
 
 Agent Comms reliability pass — fixes for cross-hub delivery and send ergonomics:
