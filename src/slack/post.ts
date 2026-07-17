@@ -24,6 +24,9 @@ export interface PostPersonaMessageOptions extends Omit<PostSlackMessageOptions,
 export interface PostedSlackMessage {
   slackTs: string;
   threadTs: string;
+  // Non-fatal warning surfaced back to the sender (e.g. a recipient that is
+  // not registered on this hub but was still posted to the shared channel).
+  warning?: string;
 }
 
 export async function postSlackMessage(options: PostSlackMessageOptions): Promise<PostedSlackMessage> {

@@ -56,17 +56,21 @@ Here is the schema.`);
     expect(result.message.taskId).toBe('bosa-phase0');
   });
 
-  it('routes inline @recipient aliases from a protocol body', () => {
+  it('keeps body @-mentions literal and out of routed recipients (B2)', () => {
     const result = parseAgentSlackEventText(`[security-audit-codex-1→NICK]
 
-@alfred-2 please review the frontend branch.`);
+@alfred-2 please review the frontend branch. Site @1a6a696 is down.`);
 
     expect(result.route).toBe('agent_header');
     if (result.route !== 'agent_header') {
       throw new Error('unexpected route');
     }
 
-    expect(result.message.recipients).toEqual(['NICK', 'alfred-2']);
+    // Recipients come only from the header; body @tokens (known or unknown)
+    // are literal text and are resolved to bonus targets later, never here.
+    expect(result.message.recipients).toEqual(['NICK']);
+    expect(result.message.body).toContain('@alfred-2');
+    expect(result.message.body).toContain('@1a6a696');
   });
 
   it('flags malformed agent protocol posts instead of routing them', () => {

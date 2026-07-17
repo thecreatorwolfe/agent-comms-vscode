@@ -1,5 +1,27 @@
 import { describe, expect, it } from 'vitest';
-import { isTrustedAgentRelayEvent, type SlackChannelMessageEvent, type SlackRuntimeIdentity } from '../slack/bolt';
+import { isTrustedAgentRelayEvent, looksLikeAgentProtocolMessage, type SlackChannelMessageEvent, type SlackRuntimeIdentity } from '../slack/bolt';
+
+describe('looksLikeAgentProtocolMessage', () => {
+  it('detects a compact protocol header', () => {
+    expect(looksLikeAgentProtocolMessage('[alfred-prime→alfred-fps]\n\nNUDGE: status?')).toBe(true);
+  });
+
+  it('detects a full protocol header with metadata', () => {
+    expect(looksLikeAgentProtocolMessage(
+      '[f8kq-server→alfred-adengine, alfred-fps] TASK:smoke | UTC:2026-07-17T02:00:00Z\nSUBJECT: hi\n\nbody',
+    )).toBe(true);
+  });
+
+  it('detects the header even after leading Slack user mentions', () => {
+    expect(looksLikeAgentProtocolMessage('<@U123> [alfred-prime→alfred-fps]\n\nping')).toBe(true);
+  });
+
+  it('ignores ordinary human chatter', () => {
+    expect(looksLikeAgentProtocolMessage('hey team can someone look at the build?')).toBe(false);
+    expect(looksLikeAgentProtocolMessage('')).toBe(false);
+    expect(looksLikeAgentProtocolMessage('[not a header] just brackets')).toBe(false);
+  });
+});
 
 describe('isTrustedAgentRelayEvent', () => {
   it('accepts a channel message from the configured Slack bot id', () => {

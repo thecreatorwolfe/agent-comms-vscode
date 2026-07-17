@@ -1,5 +1,5 @@
 import { describe, expect, it } from 'vitest';
-import { parseAgentSlackMessage } from '../schema/slack_message';
+import { MAX_BODY_LENGTH, parseAgentSlackMessage } from '../schema/slack_message';
 import { validateFrame } from '../schema/validate';
 
 describe('frame validation', () => {
@@ -65,12 +65,27 @@ Need the frontend status update.`);
     expect(parsed.recipients).toEqual(['alfred-2', 'NICK']);
   });
 
-  it('merges inline @recipient aliases from the message body into routed recipients', () => {
+  it('does not pull body @-mentions into routed recipients and keeps them literal (B2)', () => {
     const parsed = parseAgentSlackMessage(`[security-audit-codex-1→NICK]
 
-@alfred-2 can you validate the frontend handoff?`);
+@alfred-2 can you validate the frontend handoff? Site @1a6a696 is down.`);
 
-    expect(parsed.recipients).toEqual(['NICK', 'alfred-2']);
+    // Recipients come ONLY from the header. Body @tokens (known or unknown)
+    // stay as literal text and never become routed recipients.
+    expect(parsed.recipients).toEqual(['NICK']);
+    expect(parsed.body).toContain('@alfred-2');
+    expect(parsed.body).toContain('@1a6a696');
+  });
+
+  it('rejects a body longer than the documented cap (B7)', () => {
+    const longBody = 'x'.repeat(MAX_BODY_LENGTH + 1);
+    expect(() => parseAgentSlackMessage(`[security-audit-codex-1→NICK]\n\n${longBody}`)).toThrow();
+  });
+
+  it('accepts a body exactly at the documented cap (B7)', () => {
+    const maxBody = 'x'.repeat(MAX_BODY_LENGTH);
+    const parsed = parseAgentSlackMessage(`[security-audit-codex-1→NICK]\n\n${maxBody}`);
+    expect(parsed.body).toHaveLength(MAX_BODY_LENGTH);
   });
 
   it('rejects malformed asks', () => {

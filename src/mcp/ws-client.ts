@@ -31,6 +31,42 @@ export interface AgentCommsWsConnectionSnapshot {
   lastError?: string;
 }
 
+function stringifyErrorDetails(details: unknown): string | undefined {
+  if (details == null) {
+    return undefined;
+  }
+  if (typeof details === 'string') {
+    return details.trim() || undefined;
+  }
+  try {
+    return JSON.stringify(details);
+  } catch {
+    return String(details);
+  }
+}
+
+/**
+ * Build a self-describing outbound error message for the agent (the tool user).
+ * Names the offending reason, includes the hub's detail payload, and appends a
+ * concrete remedy so the agent can fix and retry without guessing. (B5)
+ */
+export function formatOutboundErrorMessage(
+  reason: 'schema_invalid' | 'unknown_recipient' | 'slack_api_error',
+  details: unknown,
+): string {
+  const detailText = stringifyErrorDetails(details);
+  const remedy = reason === 'schema_invalid'
+    ? 'Fix: send with recipients + body (not raw message). Keep the body under 4000 characters and omit protocol headers — the tool builds them.'
+    : reason === 'unknown_recipient'
+      ? 'Fix: name a live persona in recipients (see agent_comms_status), or send to NICK. Unknown names are not failed anymore; if you still see this, the persona token itself was malformed.'
+      : 'Fix: this is a Slack API error, not a validation problem — retry shortly; if it persists, check the hub Agent Comms output channel.';
+  return [
+    `Agent Comms outbound error [${reason}]`,
+    detailText ? `: ${detailText}` : '',
+    ` — ${remedy}`,
+  ].join('');
+}
+
 export class AgentCommsWsClient {
   private readonly options: AgentCommsWsClientOptions;
   private ws: WebSocket | undefined;
@@ -39,7 +75,7 @@ export class AgentCommsWsClient {
   private readonly pendingOutbound = new Map<
     string,
     {
-      resolve: (result: { slackTs: string; threadTs: string }) => void;
+      resolve: (result: { slackTs: string; threadTs: string; warning?: string }) => void;
       reject: (error: Error) => void;
       timeout: NodeJS.Timeout;
     }
@@ -145,7 +181,7 @@ export class AgentCommsWsClient {
   async sendOutboundAndWait(
     frame: Omit<OutboundFrame, 'type' | 'persona'>,
     timeoutMs = 15_000,
-  ): Promise<{ slackTs: string; threadTs: string }> {
+  ): Promise<{ slackTs: string; threadTs: string; warning?: string }> {
     if (!this.persona) {
       throw new Error('Cannot send outbound frame before auth.ack');
     }
@@ -383,6 +419,7 @@ export class AgentCommsWsClient {
         pending.resolve({
           slackTs: frame.slack_ts,
           threadTs: frame.thread_ts,
+          warning: frame.warning,
         });
         return;
       }
@@ -400,12 +437,13 @@ export class AgentCommsWsClient {
         this.options.logger?.info(`Profile reset as ${frame.persona}. Re-register before the next Slack send.`);
         return;
       case 'outbound.error': {
-        this.lastConnectionError = `Agent Comms outbound error: ${frame.reason}`;
+        const message = formatOutboundErrorMessage(frame.reason, frame.details);
+        this.lastConnectionError = message;
         const pending = frame.client_msg_id ? this.pendingOutbound.get(frame.client_msg_id) : undefined;
         if (pending) {
           clearTimeout(pending.timeout);
           this.pendingOutbound.delete(frame.client_msg_id as string);
-          pending.reject(new Error(`Agent Comms outbound error: ${frame.reason}`));
+          pending.reject(new Error(message));
         }
         this.options.logger?.warn({ frame }, 'extension returned an outbound error frame');
         return;

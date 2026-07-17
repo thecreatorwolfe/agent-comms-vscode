@@ -54,6 +54,27 @@ export interface CreateSlackBoltRuntimeOptions {
   onSlashCommand?: (event: SlackSlashCommandEvent) => Promise<string | void> | string | void;
 }
 
+const AGENT_PROTOCOL_HEADER = /^\s*\[[^\]\n]+→[^\]\n]+\]/u;
+
+/**
+ * True when the message text carries the agent coordination protocol header
+ * `[from→recipients]` on its first line. Such messages are delivered to the
+ * agent-relay path no matter which hub instance, bot token, or user token
+ * originated them: the shared Slack channel is the bus, and a peer hub (or a
+ * user-token relay) posting a message addressed to a locally-registered
+ * persona must still wake that persona. De-duplication of our own echoes and
+ * filtering to locally-registered recipients happens downstream, so this is
+ * safe from loops and cross-talk between hubs.
+ */
+export function looksLikeAgentProtocolMessage(text: string): boolean {
+  if (typeof text !== 'string' || text.length === 0) {
+    return false;
+  }
+
+  const stripped = text.replace(/<@[A-Z0-9]+>/g, ' ').trimStart();
+  return AGENT_PROTOCOL_HEADER.test(stripped);
+}
+
 export function isTrustedAgentRelayEvent(
   event: SlackChannelMessageEvent,
   identity: SlackRuntimeIdentity | undefined,
@@ -155,6 +176,17 @@ export function createSlackBoltRuntime(options: CreateSlackBoltRuntimeOptions): 
         ts: event.ts,
         thread_ts: 'thread_ts' in event ? event.thread_ts : undefined,
       };
+      // Any message carrying the agent protocol header is coordination
+      // traffic. Deliver it to the relay path regardless of which hub, bot
+      // token, or user token posted it. This is the root fix for cross-hub
+      // messages (e.g. a peer hub or a user-token relay) never waking a
+      // locally-registered persona. Downstream de-dupes our own echoes and
+      // filters to locally-registered recipients.
+      if (looksLikeAgentProtocolMessage(normalizedEvent.text)) {
+        await options.onChannelMessage(normalizedEvent);
+        return;
+      }
+
       const isBotStyleEvent = subtype === 'bot_message'
         || Boolean(normalizedEvent.bot_id)
         || Boolean(normalizedEvent.user && identity?.botUserId && normalizedEvent.user === identity.botUserId);
@@ -163,6 +195,8 @@ export function createSlackBoltRuntime(options: CreateSlackBoltRuntimeOptions): 
         return;
       }
 
+      // Bot-style traffic that is NOT agent protocol (e.g. other Slack apps).
+      // Keep the original trust gate so unrelated bot chatter is ignored.
       if (!isTrustedAgentRelayEvent(normalizedEvent, identity)) {
         options.logger?.warn(
           {
@@ -170,7 +204,7 @@ export function createSlackBoltRuntime(options: CreateSlackBoltRuntimeOptions): 
             bot_id: normalizedEvent.bot_id,
             ts: normalizedEvent.ts,
           },
-          'ignored bot-style Slack message from untrusted sender',
+          'ignored non-protocol bot-style Slack message from untrusted sender',
         );
         return;
       }

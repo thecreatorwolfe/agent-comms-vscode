@@ -105,7 +105,7 @@ export function formatAgentConnectionSnapshot(snapshot: AgentCommsConnectionSnap
     `Connection: ${snapshot.state}`,
     `Persona: ${snapshot.persona ?? 'unknown'}`,
     `Authenticated: ${snapshot.authenticated ? 'yes' : 'no'}`,
-    `Persona source: ${snapshot.personaSource ?? 'unknown'}`,
+    `Persona source: ${snapshot.personaSource === 'saved' ? 'saved (auto-reclaimed)' : snapshot.personaSource ?? 'unknown'}`,
     `Registration required: ${snapshot.registrationRequired == null ? 'unknown' : snapshot.registrationRequired ? 'yes' : 'no'}`,
     `Last error: ${snapshot.lastError ?? 'none'}`,
   ].join('\n');

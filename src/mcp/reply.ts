@@ -21,7 +21,7 @@ function normalizeRecipientToken(recipient: string): string {
 
 export const agentCommsReplyInputSchema = z.object({
   message: z.string().min(1).optional().describe(
-    'Optional raw Slack protocol body. Avoid this unless a task brief explicitly requires the full header text. The preferred minimal send is recipients + body.',
+    'Advanced escape hatch: a COMPLETE raw protocol string that already includes the [from→recipients] header. This is NOT a plain-text field — plain text without a header is rejected. Almost always leave this out and use recipients + body instead; the tool builds the header for you.',
   ),
   recipients: recipientsSchema.optional().describe(
     'Preferred structured send target(s). Minimal preferred usage: { recipients: ["alfred-2"], body: "Need review." }. Use a persona like alfred-2 or NICK. The tool stamps your current persona automatically.',
@@ -30,7 +30,7 @@ export const agentCommsReplyInputSchema = z.object({
     'Optional subject line for the verbose protocol header. Omit it unless it materially helps.',
   ),
   body: z.string().min(1).optional().describe(
-    'Preferred structured message body. Keep it as short as possible and actionable. Omit protocol headers; the tool builds them.',
+    'Preferred structured message body (max 4000 characters). Keep it as short as possible and actionable. Omit protocol headers; the tool builds them. @-mentions in the body are literal text unless they match a live persona.',
   ),
   taskId: z.string().min(1).optional().describe(
     'Optional task id. Leave it out unless it materially helps routing or later thread lookup.',
@@ -63,8 +63,8 @@ export const agentCommsReplyInputSchema = z.object({
   if (!hasRawMessage && !hasStructuredPayload) {
     ctx.addIssue({
       code: z.ZodIssueCode.custom,
-      message: 'Provide either message, or recipients + body.',
-      path: ['message'],
+      message: 'Provide recipients + body (e.g. { recipients: ["alfred-2"], body: "Need review." }). The optional raw `message` field is only for a complete pre-built protocol string with its own [from→to] header.',
+      path: ['recipients'],
     });
   }
 

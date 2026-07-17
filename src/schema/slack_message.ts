@@ -8,6 +8,12 @@ const isoTimestampSchema = z.string().refine((value) => !Number.isNaN(Date.parse
 });
 
 export const taskIdSchema = z.string().regex(/^[a-z0-9]+(?:-[a-z0-9]+)*$/);
+
+// Maximum length of a single agent message body. Documented in the
+// agent_comms_reply tool description and enforced with an explicit,
+// self-describing error so agents are never surprised by a silent cap.
+export const MAX_BODY_LENGTH = 4000;
+
 export const slackAskSchema = z.object({
   recipient: routingTokenSchema,
   resolved: z.boolean(),
@@ -27,7 +33,7 @@ export const parsedSlackMessageSchema = z.object({
   taskId: taskIdSchema.optional(),
   utc: isoTimestampSchema.optional(),
   subject: z.string().min(1).max(100).optional(),
-  body: z.string().min(1).max(3500),
+  body: z.string().min(1).max(MAX_BODY_LENGTH),
   asks: z.array(slackAskSchema),
   status: slackStatusSchema.optional(),
 });
@@ -54,7 +60,16 @@ function parseRecipients(rawRecipients: string): string[] {
     .filter(Boolean);
 }
 
-function extractInlineRecipients(text: string): string[] {
+/**
+ * Extract @-mention tokens embedded in free-form text (message body).
+ *
+ * NOTE: these tokens are NOT treated as routed recipients by the parser.
+ * The canonical recipient list comes only from the `[from→recipients]`
+ * header. Body @-mentions are resolved separately, and ONLY against live
+ * registered personas, at delivery time — an unknown @token in the body is
+ * left as literal text and never fails a send. Exported for that resolver.
+ */
+export function extractInlineRecipients(text: string): string[] {
   const matches = text.matchAll(/(?:^|[\s(])@(?<recipient>(?:ALL|NICK|[a-z0-9][a-z0-9-]{1,63}))(?=$|[\s,.:;!?)])/gimu);
   const recipients = new Set<string>();
   for (const match of matches) {
@@ -159,10 +174,13 @@ export function parseAgentSlackMessage(text: string): ParsedSlackMessage {
     asks = parseAsksBlock(remainder.slice(asksIndex + '\n\nASKS:\n'.length));
   }
 
-  const normalizedRecipients = [...new Set([
-    ...parseRecipients(headerMatch.groups.recipients),
-    ...extractInlineRecipients(remainder),
-  ])];
+  // Recipients come ONLY from the protocol header. Body text that happens to
+  // contain an @token (e.g. "Site @1a6a696") must never be pulled into the
+  // routed recipient list — doing so previously hard-failed the whole send
+  // with unknown_recipient. Body @-mentions to live personas are still
+  // delivered as bonus pings, but that resolution happens at delivery time
+  // against the live registry (see extractInlineRecipients consumers).
+  const normalizedRecipients = [...new Set(parseRecipients(headerMatch.groups.recipients))];
 
   return parsedSlackMessageSchema.parse({
     from: headerMatch.groups.from.trim(),

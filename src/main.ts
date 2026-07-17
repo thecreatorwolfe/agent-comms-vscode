@@ -19,7 +19,7 @@ import { GatewayHttpServer } from './gateway/http';
 import { WsGateway } from './gateway/ws';
 import { PROJECT_OVERRIDE_KEY, resolveProjectName } from './persona/project';
 import { parseAutomaticPersona, resolveRecipientAlias } from './persona/naming';
-import { parsedSlackMessageSchema, type ParsedSlackMessage } from './schema/slack_message';
+import { extractInlineRecipients, parsedSlackMessageSchema, type ParsedSlackMessage } from './schema/slack_message';
 import { validateSlackMessageText } from './schema/validate';
 import { spawnAgent, type SpawnRequest, type SpawnResult } from './spawn';
 import { AgentProfileStore } from './profile-store';
@@ -699,22 +699,6 @@ function buildHumanControlAck(
   return `${affectedLine}${untrackedLine}`;
 }
 
-function extractHumanRelayRecipients(text: string): string[] {
-  const matches = text.matchAll(/(?:^|[\s(])@(?<recipient>(?:ALL|NICK|[a-z0-9][a-z0-9-]{1,63}))(?=$|[\s,.:;!?)])/gimu);
-  const recipients = new Set<string>();
-  for (const match of matches) {
-    const raw = match.groups?.recipient;
-    if (!raw) {
-      continue;
-    }
-
-    const upper = raw.toUpperCase();
-    recipients.add(upper === 'ALL' || upper === 'NICK' ? upper : raw.toLowerCase());
-  }
-
-  return [...recipients];
-}
-
 function buildHumanRelayMessageForRecipients(text: string, recipients: string[]): ParsedSlackMessage | null {
   const stripped = stripSlackUserMentions(text);
   if (!stripped || recipients.length === 0) {
@@ -1030,7 +1014,7 @@ async function handleHumanChannelMessage(
     return;
   }
 
-  const mentionedRecipients = extractHumanRelayRecipients(event.text);
+  const mentionedRecipients = extractInlineRecipients(event.text);
   const activeRecipients = registry.list()
     .filter((agent) => agent.status === 'active')
     .map((agent) => agent.persona);
@@ -1070,7 +1054,16 @@ async function deliverParsedAgentMessage(
 ): Promise<void> {
   const sender = message.from;
   const requiresImmediateAttention = sender === 'NICK';
-  const { targets } = resolveEventTargets(registry, message.recipients, sender);
+  const headerTargets = resolveEventTargets(registry, message.recipients, sender).targets;
+  // Bonus routing: @-mentions inside the body that resolve to a live local
+  // persona are also pinged. Unknown @tokens (e.g. "Site @1a6a696") resolve to
+  // nothing and are silently ignored — never a failure. @ALL / @NICK in body
+  // text are treated as literal, not routing. (B2)
+  const bodyMentionTokens = extractInlineRecipients(message.body).filter(
+    (token) => token !== 'ALL' && token !== 'NICK',
+  );
+  const bodyMentionTargets = resolveEventTargets(registry, bodyMentionTokens, sender).targets;
+  const targets = [...new Set([...headerTargets, ...bodyMentionTargets])];
   await Promise.allSettled(targets.map(async (target) => {
     const deliveryId = randomUUID();
     const targetAgent = registry.get(target);
@@ -1176,6 +1169,12 @@ async function handleOutboundRequest(
   const parsedBody = validation.data;
   const livePersonas = registry.list().map((agent) => agent.persona);
   const senderPersona = resolveOutboundSenderPersona(payload.persona, parsedBody.from, livePersonas);
+  // Recipients that do not resolve to a locally-registered persona are NOT a
+  // failure. The shared Slack channel is the bus: a peer hub (or Nick's eyes)
+  // picks the message up, and the header still names the intended recipient.
+  // We post regardless and surface a non-fatal warning so the sender knows
+  // those names were not pinged on this hub. Hard-fail only if the Slack post
+  // itself fails. (B3)
   const unknownRecipients = parsedBody.recipients.filter((recipient) => {
     if (recipient === 'ALL' || recipient === 'NICK') {
       return false;
@@ -1183,18 +1182,12 @@ async function handleOutboundRequest(
 
     return resolveLiveRecipient(recipient, livePersonas) === null;
   });
-  if (unknownRecipients.length > 0) {
-    throw createRouteError('unknown_recipient', 'Outbound message includes unknown recipients', {
-      unknownRecipients,
-      knownPersonas: livePersonas,
-    });
-  }
 
   const senderAgent = registry.get(senderPersona);
   if (senderAgent?.registrationRequired) {
     throw createRouteError(
       'schema_invalid',
-      'Persona must be re-registered before sending Slack messages',
+      `Persona "${senderPersona}" must re-register before its next Slack send. Call agent_comms_rename({ customName: "${senderPersona}" }) (or your intended persona) first.`,
       { persona: senderPersona },
     );
   }
@@ -1238,6 +1231,12 @@ async function handleOutboundRequest(
     outputChannel,
     logger,
   );
+
+  if (unknownRecipients.length > 0) {
+    const warning = `Posted to the shared channel. ${unknownRecipients.join(', ')} ${unknownRecipients.length === 1 ? 'is' : 'are'} not registered on this hub, so ${unknownRecipients.length === 1 ? 'it was' : 'they were'} not pinged locally — a peer hub or Nick picks the message up from the channel.`;
+    logger?.info({ persona: senderPersona, unknownRecipients }, 'outbound delivered to channel with unresolved local recipients');
+    return { ...posted, warning };
+  }
 
   return posted;
 }

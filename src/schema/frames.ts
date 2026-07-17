@@ -64,6 +64,7 @@ export const outboundAckFrameSchema = z.object({
   client_msg_id: z.string().uuid(),
   slack_ts: z.string(),
   thread_ts: z.string(),
+  warning: z.string().optional(),
 });
 
 export const outboundErrorFrameSchema = z.object({

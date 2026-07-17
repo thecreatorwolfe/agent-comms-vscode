@@ -355,9 +355,19 @@ export class WsGateway {
             const profileInvalidated = auth.data.profile_id
               ? this.options.isProfileInvalidated?.(auth.data.profile_id) ?? false
               : false;
-            const savedPersona = auth.data.profile_id
-              ? !profileInvalidated ? this.options.resolveSavedPersona?.(auth.data.profile_id) : undefined
+            const rawSavedPersona = auth.data.profile_id && !profileInvalidated
+              ? this.options.resolveSavedPersona?.(auth.data.profile_id)
               : undefined;
+            // Reclaim the saved persona on reconnect (B8), but never steal a
+            // persona a different session is holding live right now. A holder
+            // in disconnect-grace is the normal reconnect path and is fine.
+            const savedPersonaHeldLive = rawSavedPersona
+              ? (() => {
+                const held = this.options.registry.get(rawSavedPersona);
+                return Boolean(held && !held.disconnectDeadlineAt);
+              })()
+              : false;
+            const savedPersona = rawSavedPersona && !savedPersonaHeldLive ? rawSavedPersona : undefined;
             const claimedPersonaIsTemporary = Boolean(claimedPersona?.startsWith('unregistered-'));
             const personaSource = savedPersona
               ? 'saved'
@@ -469,6 +479,7 @@ export class WsGateway {
             client_msg_id: outbound.client_msg_id,
             slack_ts: result.slackTs,
             thread_ts: result.threadTs,
+            ...(result.warning ? { warning: result.warning } : {}),
           });
         } catch (error) {
           const normalized = normalizeOutboundError(error);

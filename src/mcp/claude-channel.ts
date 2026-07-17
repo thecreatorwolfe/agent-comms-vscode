@@ -16,6 +16,7 @@ import {
   renamePersonaForReply,
 } from './reply';
 import { fetchSelfAgentStatus, formatAgentConnectionSnapshot, formatAgentStatus } from './status';
+import { MAX_BODY_LENGTH } from '../schema/slack_message';
 import { resolveBridgeEnv } from './runtime-env';
 import { AgentCommsWsClient } from './ws-client';
 import { refineSpawnModel, SPAWN_MODEL_PARAM_DESCRIPTION } from '../spawn-model';
@@ -319,7 +320,7 @@ async function main(): Promise<void> {
   server.registerTool(
     'agent_comms_reply',
     {
-      description: 'Send a Slack message through the local Agent Comms hub. Preferred minimal usage: agent_comms_reply({ recipients: ["alfred-2"], body: "Need review." }). The tool auto-builds the protocol header and can rename your persona inline before sending.',
+      description: 'Send a Slack message through the local Agent Comms hub. Preferred usage: agent_comms_reply({ recipients: ["alfred-2"], body: "Need review." }). The tool auto-builds the protocol header and can rename your persona inline before sending. recipients may name any persona (live locally, on a peer hub, or NICK) — unknown names are posted to the shared channel, not rejected. @-mentions inside body are literal text unless they match a live persona. body is capped at 4000 characters. Put text in body; the raw `message` field is an advanced escape hatch for a full pre-built protocol string only.',
       inputSchema: agentCommsReplyInputSchema,
     },
     async ({ message, recipients, subject, body, taskId, threadTs, customName, projectName, personaSuffix, instanceNumber }) => {
@@ -343,6 +344,14 @@ async function main(): Promise<void> {
         persona = renamed.persona;
       }
 
+      if (typeof body === 'string' && body.length > MAX_BODY_LENGTH) {
+        throw new Error(
+          `Message body is ${body.length} characters; the limit is ${MAX_BODY_LENGTH}. `
+          + 'Shorten it, or split it across multiple agent_comms_reply calls '
+          + '(e.g. prefix each with "(1/2) …" and "(2/2) …").',
+        );
+      }
+
       const outboundBody = message ?? buildProtocolSlackMessage({
         from: persona,
         recipients: normalizeRecipients(recipients ?? []),
@@ -357,11 +366,12 @@ async function main(): Promise<void> {
         client_msg_id: randomUUID(),
       });
 
+      const warningSuffix = posted.warning ? `\nWarning: ${posted.warning}` : '';
       return {
         content: [
           {
             type: 'text',
-            text: `Sent outbound Slack message to the Agent Comms hub at ${posted.slackTs}.`,
+            text: `Sent outbound Slack message to the Agent Comms hub at ${posted.slackTs}.${warningSuffix}`,
           },
         ],
       };

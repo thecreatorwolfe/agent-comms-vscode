@@ -1,5 +1,17 @@
 # Changelog
 
+## 0.2.47
+
+Agent Comms reliability pass — fixes for cross-hub delivery and send ergonomics:
+
+- **Inbound delivery (B1):** the hub now delivers any message carrying the `[from→recipients]` protocol header to locally-registered personas regardless of which hub instance, bot token, or user token posted it. Previously only messages from the hub's own Slack identity were relayed, so cross-hub pings (and user-token relays) never woke a locally-registered agent. Downstream de-dup and local-recipient filtering keep this loop- and cross-talk-safe.
+- **Body @-mentions no longer break sends (B2):** routed recipients come only from the protocol header. An `@token` in the body (e.g. `Site @1a6a696`) is literal text and never fails a send. Body @-mentions that match a live persona are still delivered as bonus pings.
+- **Cross-hub / unknown recipients (B3):** an outbound recipient that is not registered on this hub is no longer a hard failure — the message is posted to the shared channel (where a peer hub or Nick picks it up) and the send returns success with a warning. Hard-fail only if the Slack post itself fails.
+- **Clearer errors (B5):** outbound errors now name the reason, include the hub's detail payload, and append a concrete remedy instead of a bare code.
+- **`message` param de-trapped (B6):** the raw `message` field is documented as an advanced full-protocol escape hatch; the validator steers to `recipients + body`.
+- **Documented body cap (B7):** message body is capped at 4000 characters with an explicit, self-describing error naming the limit and actual length.
+- **Reconnect persona persistence (B8):** manually-launched agents derive a stable profile id from their working directory, so the hub auto-reclaims their persona across hub and bridge restarts instead of falling back to a temporary `unregistered-*` name.
+
 ## 0.2.19
 
 - Fixed live agent renames so the hub updates the active WebSocket session persona immediately instead of waiting for heartbeat timeout and reconnect

@@ -1,6 +1,27 @@
 import { WebSocket } from 'ws';
 import { describe, expect, it, vi } from 'vitest';
-import { AgentCommsWsClient } from '../mcp/ws-client';
+import { AgentCommsWsClient, formatOutboundErrorMessage } from '../mcp/ws-client';
+
+describe('formatOutboundErrorMessage', () => {
+  it('names the reason, includes hub detail, and appends a remedy (B5)', () => {
+    const message = formatOutboundErrorMessage('schema_invalid', 'Body sender does not match outbound persona');
+    expect(message).toContain('schema_invalid');
+    expect(message).toContain('Body sender does not match outbound persona');
+    expect(message).toContain('Fix:');
+  });
+
+  it('stringifies structured detail payloads', () => {
+    const message = formatOutboundErrorMessage('unknown_recipient', { unknownRecipients: ['ghost-1'] });
+    expect(message).toContain('unknown_recipient');
+    expect(message).toContain('ghost-1');
+  });
+
+  it('still produces a useful message when detail is absent', () => {
+    const message = formatOutboundErrorMessage('slack_api_error', undefined);
+    expect(message).toContain('slack_api_error');
+    expect(message).toContain('Fix:');
+  });
+});
 
 describe('AgentCommsWsClient waitForAuth', () => {
   it('resolves immediately once auth state is already present', async () => {
