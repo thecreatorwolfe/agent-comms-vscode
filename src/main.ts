@@ -1415,6 +1415,8 @@ export async function bootstrap(
         routerSharedSecret: env.ROUTER_SHARED_SECRET,
         extensionPath: context.extensionPath,
         codexChromeDevtoolsStartupTimeoutSec: configuration.get<number>('codexChromeDevtoolsStartupTimeoutSec'),
+        claudeDevChannelsAutoAccept: configuration.get<boolean>('claudeDevChannelsAutoAccept'),
+        claudeDevChannelsAcceptDelaysMs: configuration.get<number[]>('claudeDevChannelsAcceptDelaysMs'),
         projectOverride: context.workspaceState.get<string | undefined>(PROJECT_OVERRIDE_KEY),
         trackTerminal: (persona, terminal) => terminals.track(persona, terminal),
         logger,

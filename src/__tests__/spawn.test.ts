@@ -13,8 +13,8 @@ vi.mock('vscode', () => ({
 }));
 
 import { AgentRegistry } from '../registry/agents';
-import { buildSpawnCommand, spawnAgent, SpawnPreconditionError } from '../spawn';
-import { isSupportedSpawnModel, normalizeSpawnModel, SPAWN_MODEL_VALUES } from '../spawn-model';
+import { buildSpawnCommand, spawnAgent, SpawnPreconditionError, DEFAULT_DEV_CHANNELS_ACCEPT_DELAYS_MS } from '../spawn';
+import { isSupportedSpawnEffort, isSupportedSpawnModel, normalizeSpawnEffort, normalizeSpawnModel, SPAWN_MODEL_VALUES } from '../spawn-model';
 
 describe('spawn command building', () => {
   beforeEach(() => {
@@ -122,8 +122,37 @@ describe('spawn command model selection', () => {
     expect(() => buildSpawnCommand('claude', 'demo-alfred-1', '/tmp/brief.md', undefined, 'gpt-4o')).toThrow(/Unsupported model/);
   });
 
-  it('rejects a model on a Codex spawn', () => {
-    expect(() => buildSpawnCommand('codex', 'demo-codex-2', '/tmp/brief.md', 30, 'opus')).toThrow(/only supported for kind='claude'/);
+  it('passes a Codex model through -m (0.2.49) and refuses one a command line cannot carry', () => {
+    const command = buildSpawnCommand('codex', 'demo-codex-2', '/tmp/brief.md', 30, 'gpt-6-astra');
+    expect(command).toContain("~/.agent-comms/bin/codex-agent-comms -m 'gpt-6-astra' -c 'mcp_servers.chrome-devtools.startup_timeout_sec=30'");
+    expect(() => buildSpawnCommand('codex', 'demo-codex-2', '/tmp/brief.md', 30, 'x; rm -rf /')).toThrow(/Unsupported codex model/);
+  });
+});
+
+describe('spawn command effort selection (0.2.49)', () => {
+  it('omits --effort when none is given', () => {
+    expect(buildSpawnCommand('claude', 'demo-alfred-1', '/tmp/brief.md')).not.toContain('--effort');
+    expect(buildSpawnCommand('codex', 'demo-codex-2', '/tmp/brief.md')).not.toContain('model_reasoning_effort');
+  });
+
+  it('appends --effort for Claude and maps minimal → low', () => {
+    expect(buildSpawnCommand('claude', 'demo-alfred-1', '/tmp/brief.md', undefined, 'opus', 'xhigh'))
+      .toBe("~/.agent-comms/bin/claude-agent-comms --model 'opus' --effort 'xhigh' -n 'demo-alfred-1' \"$(cat '/tmp/brief.md')\"");
+    expect(buildSpawnCommand('claude', 'demo-alfred-1', '/tmp/brief.md', undefined, null, 'MINIMAL')).toContain("--effort 'low'");
+  });
+
+  it('appends a TOML model_reasoning_effort for Codex and maps max → xhigh', () => {
+    expect(buildSpawnCommand('codex', 'demo-codex-2', '/tmp/brief.md', undefined, null, 'high'))
+      .toBe("~/.agent-comms/bin/codex-agent-comms -c 'model_reasoning_effort=\"high\"' \"$(cat '/tmp/brief.md')\"");
+    expect(buildSpawnCommand('codex', 'demo-codex-2', '/tmp/brief.md', undefined, null, 'max')).toContain('model_reasoning_effort="xhigh"');
+  });
+
+  it('refuses an effort neither CLI knows', () => {
+    expect(() => buildSpawnCommand('claude', 'demo-alfred-1', '/tmp/brief.md', undefined, null, 'turbo')).toThrow(/Unsupported effort/);
+    expect(() => buildSpawnCommand('codex', 'demo-codex-2', '/tmp/brief.md', undefined, null, 'max-plus')).toThrow(/Unsupported effort/);
+    expect(isSupportedSpawnEffort('claude', 'max')).toBe(true);
+    expect(isSupportedSpawnEffort('codex', 'minimal')).toBe(true);
+    expect(normalizeSpawnEffort('codex', 'max')).toBe('xhigh');
   });
 });
 
@@ -143,5 +172,48 @@ describe('spawn model normalization', () => {
   it('rejects unknown values', () => {
     expect(isSupportedSpawnModel('gpt-4o')).toBe(false);
     expect(() => normalizeSpawnModel('gpt-4o')).toThrow(/Unsupported model/);
+  });
+});
+
+describe('spawn dev-channels auto-accept (0.2.49)', () => {
+  it('writes a carriage return into a Claude terminal at each delay, and never into a Codex one', async () => {
+    vi.useFakeTimers();
+    try {
+      const sendText = vi.fn();
+      terminalStubs.createTerminal.mockReturnValue({ name: 'demo-alfred-9', show: vi.fn(), sendText, dispose: vi.fn() });
+      const deps = { registry: new AgentRegistry(), workspaceRoot: '/tmp/project', extensionPort: 4011, routerSharedSecret: 'secret', extensionPath: '/tmp/extension', claudeDevChannelsAcceptDelaysMs: [100, 200] };
+      await spawnAgent({ kind: 'claude', briefFilePath: '/tmp/brief.md', taskId: 'child-a', customName: 'demo-alfred-9', reuseIdle: false, effort: 'xhigh' }, deps);
+      expect(sendText).toHaveBeenCalledTimes(1);           // the launch command only, so far
+      expect(sendText.mock.calls[0][0]).toContain("--effort 'xhigh'");
+      vi.advanceTimersByTime(150);
+      expect(sendText).toHaveBeenCalledTimes(2);
+      expect(sendText).toHaveBeenLastCalledWith('\r', false);
+      vi.advanceTimersByTime(100);
+      expect(sendText).toHaveBeenCalledTimes(3);
+
+      const codexSend = vi.fn();
+      terminalStubs.createTerminal.mockReturnValue({ name: 'demo-codex-3', show: vi.fn(), sendText: codexSend, dispose: vi.fn() });
+      await spawnAgent({ kind: 'codex', briefFilePath: '/tmp/brief.md', taskId: 'child-b', customName: 'demo-codex-3', reuseIdle: false, model: 'gpt-6-astra', effort: 'low' }, deps);
+      vi.advanceTimersByTime(1000);
+      expect(codexSend).toHaveBeenCalledTimes(1);
+      expect(codexSend.mock.calls[0][0]).toContain("-m 'gpt-6-astra' -c 'model_reasoning_effort=\"low\"'");
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
+  it('can be switched off, and has sane defaults', async () => {
+    vi.useFakeTimers();
+    try {
+      const sendText = vi.fn();
+      terminalStubs.createTerminal.mockReturnValue({ name: 'demo-alfred-10', show: vi.fn(), sendText, dispose: vi.fn() });
+      await spawnAgent({ kind: 'claude', briefFilePath: '/tmp/brief.md', taskId: 'child-c', customName: 'demo-alfred-10', reuseIdle: false },
+        { registry: new AgentRegistry(), workspaceRoot: '/tmp/project', extensionPort: 4011, routerSharedSecret: 'secret', extensionPath: '/tmp/extension', claudeDevChannelsAutoAccept: false });
+      vi.advanceTimersByTime(20000);
+      expect(sendText).toHaveBeenCalledTimes(1);
+      expect(DEFAULT_DEV_CHANNELS_ACCEPT_DELAYS_MS).toEqual([2500, 5000, 8000]);
+    } finally {
+      vi.useRealTimers();
+    }
   });
 });

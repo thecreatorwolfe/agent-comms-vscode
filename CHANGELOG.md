@@ -1,5 +1,10 @@
 # Changelog
 
+## 0.2.49
+
+- **Spawn: reasoning effort + Codex model.** `/spawn` (and the `agent_comms_spawn` MCP tool) accept `effort` — claude `low|medium|high|xhigh|max` via `--effort`, codex `minimal|low|medium|high|xhigh` via `-c model_reasoning_effort` (`max` maps to `xhigh`). `model` is now also accepted for `kind='codex'` and passed to `codex -m`. Model allowlist gains `claude-fable-5-1` and `claude-opus-5`.
+- **Spawn: channels-mode dialog auto-accepted.** A spawned Claude terminal gets a carriage return written to its stdin at 2.5s/5s/8s (`agentComms.claudeDevChannelsAutoAccept`, on by default; delays configurable) so the "WARNING: Loading development channels" prompt no longer waits for a hand on the keyboard. Terminal-stdin keystrokes need no Accessibility grant, unlike the osascript attempts that failed.
+
 ## 0.2.48
 
 - **Reliable cross-hub inbound delivery (B1, part 2):** added an active channel poller. Slack Socket Mode load-balances each realtime event across all of an app's live connections, so when the fleet shares one Slack app a message event reaches only ONE hub — often not the hub that owns the addressed persona — which left agents "not responding" with pending pings stuck at 0. The hub now also polls `conversations.history` every 5s and delivers any protocol message addressed to a locally-registered persona, de-duplicated against the realtime path so nothing is delivered twice. This makes inbound delivery deterministic regardless of which connection Slack routed the event to.

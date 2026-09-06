@@ -19,7 +19,7 @@ import { fetchSelfAgentStatus, formatAgentConnectionSnapshot, formatAgentStatus 
 import { MAX_BODY_LENGTH } from '../schema/slack_message';
 import { resolveBridgeEnv } from './runtime-env';
 import { AgentCommsWsClient } from './ws-client';
-import { refineSpawnModel, SPAWN_MODEL_PARAM_DESCRIPTION } from '../spawn-model';
+import { refineSpawnEffort, refineSpawnModel, SPAWN_MODEL_PARAM_DESCRIPTION , SPAWN_EFFORT_PARAM_DESCRIPTION } from '../spawn-model';
 
 function buildChannelContent(frame: { from_persona: string; task_id?: string; body_raw: string }): string {
   const priorityPrefix = frame.from_persona === 'NICK' ? '[PRIORITY:HIGH]\n' : '';
@@ -126,7 +126,7 @@ async function main(): Promise<void> {
   server.registerTool(
     'agent_comms_spawn',
     {
-      description: "Request that the local Agent Comms hub spawn a new Claude or Codex peer in VS Code. This is local-only and does not go through Slack. Parent spawns must assign the child persona up front with customName or with personaSuffix/instanceNumber (optionally plus projectName). The terminal opens under that persona immediately. Pass `model` to choose the spawned Claude session's model (kind='claude' only).",
+      description: "Request that the local Agent Comms hub spawn a new Claude or Codex peer in VS Code. This is local-only and does not go through Slack. Parent spawns must assign the child persona up front with customName or with personaSuffix/instanceNumber (optionally plus projectName). The terminal opens under that persona immediately. Pass `model` to choose the spawned session's model (claude alias/id, or a codex model name) and `effort` to set its reasoning effort.",
       inputSchema: z.object({
         kind: z.enum(['claude', 'codex']),
         briefFilePath: z.string().min(1).describe('Absolute path to the child brief file to feed into the new terminal session.'),
@@ -137,6 +137,7 @@ async function main(): Promise<void> {
         instanceNumber: z.number().int().min(1).optional().describe('Optional automatic instance number when you want project-kind numbering.'),
         reuseIdle: z.boolean().optional().describe('Reuse an idle matching peer instead of spawning fresh only when that is intentional.'),
         model: z.string().min(1).optional().describe(SPAWN_MODEL_PARAM_DESCRIPTION),
+        effort: z.string().min(1).optional().describe(SPAWN_EFFORT_PARAM_DESCRIPTION),
       }).refine(
         (value) => (
           value.customName !== undefined
@@ -146,7 +147,7 @@ async function main(): Promise<void> {
         'Parent spawns must provide customName, personaSuffix, or instanceNumber so the child terminal is named deterministically.',
       ).superRefine((value, ctx) => refineSpawnModel(value, ctx)),
     },
-    async ({ kind, briefFilePath, taskId, customName, projectName, personaSuffix, instanceNumber, reuseIdle, model }) => {
+    async ({ kind, briefFilePath, taskId, customName, projectName, personaSuffix, instanceNumber, reuseIdle, model, effort }) => {
       await client.waitForAuth();
       const response = await fetch(`http://127.0.0.1:${port}/spawn`, {
         method: 'POST',
@@ -165,6 +166,7 @@ async function main(): Promise<void> {
           task_id: taskId,
           reuse_idle: reuseIdle ?? null,
           model: model ?? null,
+          effort: effort ?? null,
         }),
       });
 

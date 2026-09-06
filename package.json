@@ -2,7 +2,7 @@
   "name": "agent-comms-vscode",
   "displayName": "Agent Orchestration",
   "description": "Coordinate Claude Code and OpenAI Codex agents via Slack from any VS Code workspace through a user-installed hub.",
-  "version": "0.2.48",
+  "version": "0.2.49",
   "publisher": "override-agency",
   "private": false,
   "engines": {
@@ -69,6 +69,17 @@
           "default": 30,
           "minimum": 1,
           "description": "Startup timeout override applied to spawned Codex sessions for the chrome-devtools MCP server. This gives Chrome DevTools more time to initialize before Codex marks it failed."
+        },
+        "agentComms.claudeDevChannelsAutoAccept": {
+          "type": "boolean",
+          "default": true,
+          "description": "After spawning a Claude terminal in channels mode, send Enter into that terminal a few times so the 'WARNING: Loading development channels' dialog is accepted without a hand on the keyboard."
+        },
+        "agentComms.claudeDevChannelsAcceptDelaysMs": {
+          "type": "array",
+          "items": { "type": "number" },
+          "default": [2500, 5000, 8000],
+          "description": "When the auto-accept keystrokes are sent, in milliseconds after the spawn command."
         },
         "agentComms.slackIconsBaseUrl": {
           "type": "string",
