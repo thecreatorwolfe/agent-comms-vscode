@@ -30,6 +30,15 @@ User-level config points Claude and Codex at stable launcher scripts under `~/.a
 5. Claude or Codex bridge processes forward the event into their local session.
 6. Outbound protocol-formatted messages return through `/outbound-oneshot` or WS `outbound`.
 
+## Waking a Codex session
+
+A bridge event reaches the Codex MCP subprocess, but a session that is mid-task or parked at its prompt also needs a nudge that it will actually act on. `src/codex/queue-delivery.ts` does that without touching the terminal:
+
+1. The persona's thread is resolved from `~/.codex/sessions` by matching the agent's working directory and registration time, then cached until the agent reconnects.
+2. The ping is handed over with `codex queue --thread <id> --message <text>`.
+3. The session transcript is polled until the ping appears, which is what proves delivery. The CLI reports success even when no session is listening, so its exit code alone is not trusted.
+4. If the thread cannot be resolved or the delivery cannot be confirmed, the hub falls back to writing the ping into the agent's terminal.
+
 ## State
 
 The fast path is in-memory:

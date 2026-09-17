@@ -15,6 +15,12 @@ import { ChannelInboundPoller, CHANNEL_POLL_INTERVAL_MS } from './slack/channel-
 import { parseAgentSlackEventText, parseHumanSlackControl, stripSlackUserMentions } from './slack/parse';
 import { postPersonaMessage, postSlackMessage, type PostedSlackMessage } from './slack/post';
 import { AgentRegistry, type AgentRecord } from './registry/agents';
+import {
+  CodexThreadIndex,
+  codexSessionsRoot,
+  createQueueDeliveryDeps,
+  deliverViaQueue,
+} from './codex/queue-delivery';
 import { SpawnedTerminalRegistry } from './registry/terminals';
 import { GatewayHttpServer } from './gateway/http';
 import { WsGateway } from './gateway/ws';
@@ -419,6 +425,90 @@ function buildActiveAgentPromptInput(
 ): string {
   const task = message.taskId ? ` Task: ${message.taskId}.` : '';
   return `Agent Comms ping from ${sender} to ${target}.${task} Stop and check Slack now with agent_comms_read_slack, then acknowledge or reply if needed. If you are already handling this ping, ignore this duplicate.`;
+}
+
+/** The part of the ping that identifies it inside a Codex transcript. */
+function buildCodexPingMarker(target: string, sender: string): string {
+  return `Agent Comms ping from ${sender} to ${target}`;
+}
+
+const codexThreadIndex = new CodexThreadIndex();
+const codexQueueDeps = createQueueDeliveryDeps();
+
+export type CodexWakeMode = 'queue' | 'inject' | 'skip';
+
+/**
+ * Wakes a Codex agent, preferring `codex queue` over terminal injection.
+ *
+ * The queue path hands the ping to the session itself, so it survives a busy
+ * agent and does not depend on the terminal accepting synthetic input. Terminal
+ * injection stays as the fallback for sessions whose thread cannot be resolved
+ * or confirmed, so nothing regresses when the CLI path is unavailable.
+ */
+async function wakeCodexAgent(
+  targetAgent: AgentRecord,
+  sender: string,
+  message: ParsedSlackMessage,
+  terminals: SpawnedTerminalRegistry,
+  outputChannel: vscode.OutputChannel,
+): Promise<CodexWakeMode> {
+  const configuration = vscode.workspace.getConfiguration('agentComms');
+  const queueEnabled = configuration.get<boolean>('codexQueueDelivery') ?? true;
+
+  if (queueEnabled) {
+    try {
+      const thread = await codexThreadIndex.lookup(
+        {
+          persona: targetAgent.persona,
+          cwd: targetAgent.cwd,
+          pid: targetAgent.pid,
+          connectedAt: targetAgent.connectedAt,
+        },
+        codexQueueDeps,
+        codexSessionsRoot(),
+      );
+
+      if (!thread) {
+        outputChannel.appendLine(
+          `[agent-comms] no Codex thread resolved for ${targetAgent.persona} in ${targetAgent.cwd}; falling back to terminal injection`,
+        );
+      } else {
+        const outcome = await deliverViaQueue(
+          {
+            cliPath: configuration.get<string>('codexCliPath') || 'codex',
+            threadId: thread.threadId,
+            rolloutPath: thread.rolloutPath,
+            message: buildActiveAgentPromptInput(targetAgent.persona, sender, message),
+            marker: buildCodexPingMarker(targetAgent.persona, sender),
+            confirmTimeoutMs: configuration.get<number>('codexQueueConfirmMs') ?? undefined,
+          },
+          codexQueueDeps,
+        );
+
+        if (outcome.ok) {
+          outputChannel.appendLine(
+            `[agent-comms] queued Agent Comms ping into Codex thread ${thread.threadId} for ${targetAgent.persona} `
+            + `confirmed in ${outcome.confirmedInMs}ms`,
+          );
+          return 'queue';
+        }
+
+        codexThreadIndex.forget(targetAgent.persona);
+        outputChannel.appendLine(
+          `[agent-comms] codex queue delivery to ${targetAgent.persona} (thread ${thread.threadId}) not confirmed: ${outcome.reason}; falling back to terminal injection`,
+        );
+      }
+    } catch (error) {
+      const detail = error instanceof Error ? error.message : String(error);
+      codexThreadIndex.forget(targetAgent.persona);
+      outputChannel.appendLine(
+        `[agent-comms] codex queue delivery errored for ${targetAgent.persona}: ${detail}; falling back to terminal injection`,
+      );
+    }
+  }
+
+  const injected = await promptTrackedAgentTerminal(targetAgent, sender, message, terminals, outputChannel);
+  return injected ? 'inject' : 'skip';
 }
 
 async function promptTrackedAgentTerminal(
@@ -1115,38 +1205,38 @@ async function deliverParsedAgentMessage(
 
     if (!wasIdle && targetAgent.activity === 'working') {
       const eventAck = await wsGateway.waitForEventAck(deliveryId, 250);
-      const prompted = targetAgent.kind === 'codex'
-        ? await promptTrackedAgentTerminal(targetAgent, sender, message, terminals, outputChannel)
-        : false;
+      const wake: CodexWakeMode = targetAgent.kind === 'codex'
+        ? await wakeCodexAgent(targetAgent, sender, message, terminals, outputChannel)
+        : 'skip';
       void vscode.window.showInformationMessage(buildActiveAgentAttentionNotice(target, sender, message));
       outputChannel.appendLine(
         requiresImmediateAttention
-          ? `[agent-comms] ${traceSummary} high-priority active-working branch ${formatEventAckSummary(eventAck)}${prompted ? ' prompt=ok' : ' prompt=skip'}`
-          : `[agent-comms] ${traceSummary} active-working branch ${formatEventAckSummary(eventAck)}${prompted ? ' prompt=ok' : ' prompt=skip'}`,
+          ? `[agent-comms] ${traceSummary} high-priority active-working branch ${formatEventAckSummary(eventAck)} prompt=${wake}`
+          : `[agent-comms] ${traceSummary} active-working branch ${formatEventAckSummary(eventAck)} prompt=${wake}`,
       );
       return;
     }
 
     if (!wasIdle) {
       const eventAck = await wsGateway.waitForEventAck(deliveryId, 800);
-      const prompted = targetAgent.kind === 'codex'
-        ? await promptTrackedAgentTerminal(targetAgent, sender, message, terminals, outputChannel)
-        : false;
+      const wake: CodexWakeMode = targetAgent.kind === 'codex'
+        ? await wakeCodexAgent(targetAgent, sender, message, terminals, outputChannel)
+        : 'skip';
       void vscode.window.showInformationMessage(buildActiveAgentAttentionNotice(target, sender, message));
       outputChannel.appendLine(
-        `[agent-comms] ${traceSummary} active-waiting branch ${formatEventAckSummary(eventAck)}${prompted ? ' prompt=ok' : targetAgent.kind === 'codex' ? ' prompt=skip' : ''}`,
+        `[agent-comms] ${traceSummary} active-waiting branch ${formatEventAckSummary(eventAck)}${targetAgent.kind === 'codex' ? ` prompt=${wake}` : ''}`,
       );
       return;
     }
 
     const eventAck = await wsGateway.waitForEventAck(deliveryId, 800);
     registry.markResume(target, message.taskId);
-    const prompted = targetAgent.kind === 'codex'
-      ? await promptTrackedAgentTerminal(targetAgent, sender, message, terminals, outputChannel)
-      : false;
+    const wake: CodexWakeMode = targetAgent.kind === 'codex'
+      ? await wakeCodexAgent(targetAgent, sender, message, terminals, outputChannel)
+      : 'skip';
     void vscode.window.showInformationMessage(buildActiveAgentAttentionNotice(target, sender, message));
     outputChannel.appendLine(
-      `[agent-comms] ${traceSummary} idle branch ${formatEventAckSummary(eventAck)} resume=ok${prompted ? ' prompt=ok' : targetAgent.kind === 'codex' ? ' prompt=skip' : ''}`,
+      `[agent-comms] ${traceSummary} idle branch ${formatEventAckSummary(eventAck)} resume=ok${targetAgent.kind === 'codex' ? ` prompt=${wake}` : ''}`,
     );
   }));
 }

@@ -1,5 +1,13 @@
 # Changelog
 
+## Unreleased
+
+- **Codex inbound delivery no longer depends on the terminal.** Pings to a Codex agent are handed to the session with `codex queue --thread <id> --message <text>` instead of being typed into its VS Code terminal. An idle session picks the message up immediately; a busy session consumes it at the next turn boundary, so a working agent no longer loses pings. Measured on a live session: delivery confirmed 2.9s after queueing, and a message queued 0.1s into a 38s task was consumed 0.5s after that task finished.
+- **Every queued delivery is confirmed.** `codex queue` can report success when nothing is listening, so the hub waits for the ping to appear in the session's transcript before counting it delivered. Unconfirmed deliveries fall back to the old terminal injection, so nothing regresses when the CLI path is unavailable.
+- Threads are matched to personas by the agent's working directory and registration time, cached per agent process, and re-resolved when an agent reconnects.
+- New settings: `agentComms.codexQueueDelivery` (on by default), `agentComms.codexCliPath`, `agentComms.codexQueueConfirmMs`.
+- Output-channel lines for Codex now read `prompt=queue`, `prompt=inject`, or `prompt=skip` so the delivery path used is visible per ping.
+
 ## 0.2.49
 
 - **Spawn: reasoning effort + Codex model.** `/spawn` (and the `agent_comms_spawn` MCP tool) accept `effort` — claude `low|medium|high|xhigh|max` via `--effort`, codex `minimal|low|medium|high|xhigh` via `-c model_reasoning_effort` (`max` maps to `xhigh`). `model` is now also accepted for `kind='codex'` and passed to `codex -m`. Model allowlist gains `claude-fable-5-1` and `claude-opus-5`.

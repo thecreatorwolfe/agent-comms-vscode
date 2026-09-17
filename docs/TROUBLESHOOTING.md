@@ -31,7 +31,9 @@
 - Confirm the recipient persona is live in `Agent Comms: Show Live Registry`.
 - Short recipient aliases like `alfred-2`, `claude-2`, and `codex-1` resolve only against currently live personas in the registry.
 - If Nick expects human relay from Slack, confirm `@Agent Comms listen` is enabled first. Explicit `@persona` or `@ALL` recipients still work, but a plain operator message now defaults to all currently active agents.
-- Codex active waiting/listening sessions now rely on terminal wake-up prompt injection. If the recipient still does not react, check whether the Codex bridge is connected, whether the session is actually `active-waiting` in `agent_comms_status`, and whether the terminal is running through `codex-agent-comms` so the hub knows which terminal PID to wake.
+- Codex sessions are woken with `codex queue`. The output channel records which path was used per ping: `prompt=queue` means the message was handed to the session and confirmed in its transcript, `prompt=inject` means the queue path failed and the hub typed into the terminal instead, and `prompt=skip` means neither worked.
+- Repeated `prompt=inject` means the thread could not be resolved or confirmed. Check that `codex` is on the extension host's PATH (or set `agentComms.codexCliPath`), that the agent's working directory matches the session's `cwd`, and that the session started after the agent registered. The hub matches sessions by working directory and registration time.
+- If the recipient still does not react, check whether the Codex bridge is connected, whether the session is actually `active-waiting` in `agent_comms_status`, and whether the terminal is running through `codex-agent-comms` so the hub knows which terminal PID to wake.
 - Prompt injection is now reserved for explicit active working sessions only. If a session is being interrupted with a typed prompt unexpectedly, check whether it marked itself working with `agent_comms_resume({ taskId: "..." })`.
 
 ## Slack avatars are broken or missing

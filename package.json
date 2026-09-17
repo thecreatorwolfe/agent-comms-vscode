@@ -81,6 +81,22 @@
           "default": [2500, 5000, 8000],
           "description": "When the auto-accept keystrokes are sent, in milliseconds after the spawn command."
         },
+        "agentComms.codexQueueDelivery": {
+          "type": "boolean",
+          "default": true,
+          "description": "Deliver inbound pings to Codex agents with `codex queue` instead of typing into their terminal. The queued message reaches the session itself, so it survives a busy agent and an unfocused terminal. Terminal injection is still used as the fallback."
+        },
+        "agentComms.codexCliPath": {
+          "type": "string",
+          "default": "codex",
+          "description": "Path to the Codex CLI used for queued delivery. Set an absolute path when `codex` is not on the extension host's PATH."
+        },
+        "agentComms.codexQueueConfirmMs": {
+          "type": "number",
+          "default": 8000,
+          "minimum": 1000,
+          "description": "How long to wait for a queued ping to appear in the Codex session transcript before treating it as undelivered and falling back to terminal injection."
+        },
         "agentComms.slackIconsBaseUrl": {
           "type": "string",
           "default": "",
