@@ -1,5 +1,9 @@
 # Changelog
 
+## 0.2.57
+
+- Preserve partial-input warnings for every error after text submission, including a failed second process check or failed Enter write. Never describe these outcomes as safe to retry automatically.
+
 ## 0.2.56
 
 - Send slash text and Enter as separate terminal writes, with a pause and fresh process check. Live Codex testing showed an immediate Enter is absorbed by paste-burst detection instead of submitting the command. Both writes stay bound to the exact terminal object.

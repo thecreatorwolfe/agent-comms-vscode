@@ -55,4 +55,25 @@ describe('slash command terminal bridge', () => {
       expect(b.sendText).toHaveBeenCalledTimes(2);
     } finally { bridge.dispose(); state.terminals = []; await fs.rm(directory, { recursive: true, force: true }); }
   });
+  it('reports partial text and omits Enter when the second foreground check fails', async () => {
+    const directory = await fs.mkdtemp(path.join(os.tmpdir(), 'slash-partial-'));
+    const terminal = { name: 'test', processId: Promise.resolve(10), sendText: vi.fn(), show: vi.fn() };
+    state.terminals = [terminal];
+    let reads = 0;
+    const bridge = await startSlashTerminalBridge(() => {}, { directory, readProcesses: async () => {
+      if (++reads === 3) throw new Error('fixture ps timeout');
+      return parseProcesses('10 1 10 20 zsh\n20 10 20 20 codex');
+    } });
+    try {
+      const m = JSON.parse(await fs.readFile(path.join(directory, (await fs.readdir(directory))[0]), 'utf8'));
+      const headers = { Authorization: `Bearer ${m.secret}`, 'Content-Type': 'application/json' };
+      const listing = await (await fetch(`http://127.0.0.1:${m.port}/targets`, { headers })).json();
+      const response = await fetch(`http://127.0.0.1:${m.port}/slash-command`, { method: 'POST', headers,
+        body: JSON.stringify({ target_id: listing.targets[0].target_id, agent_pid: 20, command: '/status', ready_for_input: true }) });
+      expect(response.status).toBe(500);
+      expect((await response.json()).error).toContain('Input text may be present; Enter was not attempted. Inspect before retrying.');
+      expect(terminal.sendText.mock.calls).toEqual([['/status', false]]);
+    } finally { bridge.dispose(); state.terminals = []; await fs.rm(directory, { recursive: true, force: true }); }
+  });
+
 });

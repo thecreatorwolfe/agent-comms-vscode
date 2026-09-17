@@ -65,6 +65,8 @@ export async function startSlashTerminalBridge(log: (text: string) => void, opti
     }));
   };
   const server = http.createServer(async (req, res) => {
+    let textAttempted = false;
+    let enterAttempted = false;
     const reply = (status: number, value: unknown) => { res.writeHead(status, { 'Content-Type': 'application/json' }); res.end(JSON.stringify(value)); };
     if (!constantTimeSecretEquals(secret, req.headers.authorization?.replace(/^Bearer /, ''))) { reply(401, { error: 'unauthorized' }); return; }
     try {
@@ -99,12 +101,14 @@ export async function startSlashTerminalBridge(log: (text: string) => void, opti
         terminal.show(true);
         // CLI paste-burst detection treats an immediate Enter as part of the paste.
         // Keep both writes bound to this Terminal object, never the active terminal.
+        textAttempted = true;
         terminal.sendText(input.command, false);
         await new Promise(resolve => setTimeout(resolve, 350));
         const beforeEnter = (await snapshot()).find(t => t.target_id === input.target_id);
         if (!vscode.window.terminals.includes(terminal) || beforeEnter?.agent_pid !== input.agent_pid) {
           reply(409, { error: 'target_changed_after_text; text may be present but Enter was not sent. Inspect before retrying.' }); return;
         }
+        enterAttempted = true;
         terminal.sendText('\r', false);
         const receipt = { status: 'submitted', target_id: target.target_id, name: target.name, kind: target.kind,
           agent_pid: target.agent_pid, command: input.command, at: new Date().toISOString(),
@@ -112,7 +116,12 @@ export async function startSlashTerminalBridge(log: (text: string) => void, opti
         log(`slash command submitted target=${target.target_id} agent=${target.agent_pid} command=${input.command.split(' ')[0]}`);
         reply(200, receipt);
       } finally { sending = false; }
-    } catch (error) { reply(500, { error: error instanceof Error ? error.message : String(error) }); }
+    } catch (error) {
+      const detail = error instanceof Error ? error.message : String(error);
+      const phase = enterAttempted ? 'Submission outcome unknown; Enter may have been sent. Inspect before retrying. '
+        : textAttempted ? 'Input text may be present; Enter was not attempted. Inspect before retrying. ' : '';
+      reply(500, { error: phase + detail });
+    }
   });
   server.requestTimeout = 5000;
   await new Promise<void>((resolve, reject) => { server.once('error', reject); server.listen(0, '127.0.0.1', () => { server.off('error', reject); resolve(); }); });
