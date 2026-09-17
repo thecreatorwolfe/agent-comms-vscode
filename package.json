@@ -2,7 +2,7 @@
   "name": "agent-comms-vscode",
   "displayName": "Agent Orchestration",
   "description": "Coordinate Claude Code and OpenAI Codex agents via Slack from any VS Code workspace through a user-installed hub.",
-  "version": "0.2.49",
+  "version": "0.2.50",
   "publisher": "override-agency",
   "private": false,
   "engines": {
@@ -77,8 +77,14 @@
         },
         "agentComms.claudeDevChannelsAcceptDelaysMs": {
           "type": "array",
-          "items": { "type": "number" },
-          "default": [2500, 5000, 8000],
+          "items": {
+            "type": "number"
+          },
+          "default": [
+            2500,
+            5000,
+            8000
+          ],
           "description": "When the auto-accept keystrokes are sent, in milliseconds after the spawn command."
         },
         "agentComms.codexQueueDelivery": {

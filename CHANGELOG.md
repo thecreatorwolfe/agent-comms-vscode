@@ -1,6 +1,6 @@
 # Changelog
 
-## Unreleased
+## 0.2.50
 
 - **Codex inbound delivery no longer depends on the terminal.** Pings to a Codex agent are handed to the session with `codex queue --thread <id> --message <text>` instead of being typed into its VS Code terminal. An idle session picks the message up immediately; a busy session consumes it at the next turn boundary, so a working agent no longer loses pings. Measured on a live session: delivery confirmed 2.9s after queueing, and a message queued 0.1s into a 38s task was consumed 0.5s after that task finished.
 - **Every queued delivery is confirmed.** `codex queue` can report success when nothing is listening, so the hub waits for the ping to appear in the session's transcript before counting it delivered. Unconfirmed deliveries fall back to the old terminal injection, so nothing regresses when the CLI path is unavailable.
