@@ -1,5 +1,9 @@
 # Changelog
 
+## 0.2.56
+
+- Send slash text and Enter as separate terminal writes, with a pause and fresh process check. Live Codex testing showed an immediate Enter is absorbed by paste-burst detection instead of submitting the command. Both writes stay bound to the exact terminal object.
+
 ## 0.2.55
 
 - Add a local, authenticated terminal bridge in each VS Code window so Soph can discover, reveal, and submit slash commands to a selected integrated Codex or Claude Code terminal. Stable window/terminal IDs and a refreshed foreground process check reject closed/replaced targets; command receipts distinguish submitted input from verified execution.

@@ -97,7 +97,15 @@ export async function startSlashTerminalBridge(log: (text: string) => void, opti
         const terminal = targets.get(input.target_id.split(':')[1]);
         if (!terminal || !vscode.window.terminals.includes(terminal)) { reply(409, { error: 'target_closed' }); return; }
         terminal.show(true);
-        terminal.sendText(input.command, true);
+        // CLI paste-burst detection treats an immediate Enter as part of the paste.
+        // Keep both writes bound to this Terminal object, never the active terminal.
+        terminal.sendText(input.command, false);
+        await new Promise(resolve => setTimeout(resolve, 350));
+        const beforeEnter = (await snapshot()).find(t => t.target_id === input.target_id);
+        if (!vscode.window.terminals.includes(terminal) || beforeEnter?.agent_pid !== input.agent_pid) {
+          reply(409, { error: 'target_changed_after_text; text may be present but Enter was not sent. Inspect before retrying.' }); return;
+        }
+        terminal.sendText('\r', false);
         const receipt = { status: 'submitted', target_id: target.target_id, name: target.name, kind: target.kind,
           agent_pid: target.agent_pid, command: input.command, at: new Date().toISOString(),
           execution_verified: false, note: 'Input submitted once. Inspect the terminal for completion, unsupported commands, or a menu/confirmation. Do not retry automatically.' };

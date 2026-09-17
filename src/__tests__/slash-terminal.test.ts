@@ -44,14 +44,15 @@ describe('slash command terminal bridge', () => {
       const response = await call('/slash-command', input);
       expect(await response.json()).toMatchObject({ status: 'submitted', execution_verified: false, kind: 'claude' });
       expect(a.sendText).not.toHaveBeenCalled();
-      expect(b.sendText).toHaveBeenCalledTimes(1);
-      expect(b.sendText).toHaveBeenCalledWith('/compact', true);
+      expect(b.sendText).toHaveBeenCalledTimes(2);
+      expect(b.sendText).toHaveBeenNthCalledWith(1, '/compact', false);
+      expect(b.sendText).toHaveBeenNthCalledWith(2, '\r', false);
       for (const bad of [{ ...input, command: 'echo bad' }, { ...input, ready_for_input: false }, { ...input, command: '/compact\n/exit' }]) expect((await call('/slash-command', bad)).status).toBe(400);
       rows = rows.filter(r => r.pid !== 40);
       expect((await call('/slash-command', input)).status).toBe(409);
       state.terminals = [a];
       expect((await call('/slash-command', input)).status).toBe(409);
-      expect(b.sendText).toHaveBeenCalledTimes(1);
+      expect(b.sendText).toHaveBeenCalledTimes(2);
     } finally { bridge.dispose(); state.terminals = []; await fs.rm(directory, { recursive: true, force: true }); }
   });
 });
