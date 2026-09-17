@@ -1,5 +1,10 @@
 # Changelog
 
+## 0.2.58
+
+- **Fixed a process listing that could hang the hub.** Asking `ps` for the tty column never returns on this machine, and the hub's terminal matching asked for it on every lookup, so that path stalled indefinitely. This is the most likely reason terminal wake-ups went missing. Parent lookups no longer request tty at all, the terminal query is separate and time-boxed, and a stall now degrades to "no terminal data" instead of blocking. Measured after the fix: ancestry 60ms where it previously never returned.
+- Session resolution therefore works: with two agents spawned into the same directory, each resolved to its own transcript in about 200ms.
+
 ## 0.2.57
 
 - Preserve partial-input warnings for every error after text submission, including a failed second process check or failed Enter write. Never describe these outcomes as safe to retry automatically.
