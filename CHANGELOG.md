@@ -1,5 +1,10 @@
 # Changelog
 
+## 0.2.55
+
+- Add a local, authenticated terminal bridge in each VS Code window so Soph can discover, reveal, and submit slash commands to a selected integrated Codex or Claude Code terminal. Stable window/terminal IDs and a refreshed foreground process check reject closed/replaced targets; command receipts distinguish submitted input from verified execution.
+- Slash submission is separate from Agent Comms wake delivery. It requires an observed idle, empty input prompt and rejects multi-line/control input. No new dependencies or environment variables.
+
 ## 0.2.54
 
 - **Spawned Codex agents are addressable under their own name immediately.** Codex launches MCP servers with a sanitized environment, so the persona the hub set on the terminal never reached the agent-comms bridge. The bridge connected unnamed, the hub refused to route to the spawn-assigned name, and the agent silently missed pings until it called `agent_comms_rename` itself. The persona, port, and profile id now ride in through `mcp_servers.agent-comms.env`, which Codex does pass through. Verified by reading the bridge process environment: before, all three were absent; after, all three are present. The router secret is deliberately not passed this way, because the launch command line is readable by any local process; the bridge still reads it from `~/.agent-comms/.env`.
