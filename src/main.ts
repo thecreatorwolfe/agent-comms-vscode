@@ -438,6 +438,15 @@ const codexQueueDeps = createQueueDeliveryDeps();
 export type CodexWakeMode = 'queue' | 'inject' | 'skip';
 
 /**
+ * Terminal injection is retired. It depended on the terminal accepting
+ * synthetic input, which is why pings went missing, and `codex queue` covers
+ * the cases it was there for. The setting re-enables it as an escape hatch.
+ */
+function codexInjectionFallbackEnabled(configuration: vscode.WorkspaceConfiguration): boolean {
+  return configuration.get<boolean>('codexTerminalInjectionFallback') ?? false;
+}
+
+/**
  * Wakes a Codex agent, preferring `codex queue` over terminal injection.
  *
  * The queue path hands the ping to the session itself, so it survives a busy
@@ -505,6 +514,15 @@ async function wakeCodexAgent(
         `[agent-comms] codex queue delivery errored for ${targetAgent.persona}: ${detail}; falling back to terminal injection`,
       );
     }
+  }
+
+  if (!codexInjectionFallbackEnabled(configuration)) {
+    outputChannel.appendLine(
+      `[agent-comms] no terminal-injection fallback for ${targetAgent.persona}; it is retired. `
+      + 'The ping still reached the bridge over the websocket. '
+      + 'Set agentComms.codexTerminalInjectionFallback to re-enable typing into the terminal.',
+    );
+    return 'skip';
   }
 
   const injected = await promptTrackedAgentTerminal(targetAgent, sender, message, terminals, outputChannel);

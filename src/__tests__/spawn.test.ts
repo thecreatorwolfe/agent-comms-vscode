@@ -13,7 +13,7 @@ vi.mock('vscode', () => ({
 }));
 
 import { AgentRegistry } from '../registry/agents';
-import { buildSpawnCommand, spawnAgent, SpawnPreconditionError, DEFAULT_DEV_CHANNELS_ACCEPT_DELAYS_MS } from '../spawn';
+import { buildSpawnCommand, spawnAgent, SpawnPreconditionError, DEFAULT_DEV_CHANNELS_ACCEPT_DELAYS_MS, type CodexBridgeEnv } from '../spawn';
 import { isSupportedSpawnEffort, isSupportedSpawnModel, normalizeSpawnEffort, normalizeSpawnModel, SPAWN_MODEL_VALUES } from '../spawn-model';
 
 describe('spawn command building', () => {
@@ -26,6 +26,46 @@ describe('spawn command building', () => {
 
     expect(command).toContain("~/.agent-comms/bin/codex-agent-comms -c 'mcp_servers.chrome-devtools.startup_timeout_sec=30'");
     expect(command).toContain('"$(cat \'/tmp/brief.md\')"');
+  });
+
+  it('passes the reserved persona to the Codex bridge through MCP server env', () => {
+    // Codex sanitizes the environment for MCP servers, so the terminal env
+    // never reaches the bridge and it would connect unnamed.
+    const command = buildSpawnCommand('codex', 'demo-codex-2', '/tmp/brief.md', undefined, undefined, undefined, {
+      AGENT_COMMS_PERSONA: 'demo-codex-2',
+      AGENT_COMMS_PORT: '47592',
+      AGENT_COMMS_PROFILE_ID: '11111111-2222-3333-4444-555555555555',
+    });
+
+    expect(command).toContain("-c 'mcp_servers.agent-comms.env.AGENT_COMMS_PERSONA=\"demo-codex-2\"'");
+    expect(command).toContain("-c 'mcp_servers.agent-comms.env.AGENT_COMMS_PORT=\"47592\"'");
+    expect(command).toContain("-c 'mcp_servers.agent-comms.env.AGENT_COMMS_PROFILE_ID=\"11111111-2222-3333-4444-555555555555\"'");
+  });
+
+  it('omits bridge env overrides that have no value', () => {
+    const command = buildSpawnCommand('codex', 'demo-codex-2', '/tmp/brief.md', undefined, undefined, undefined, {
+      AGENT_COMMS_PERSONA: 'demo-codex-2',
+      AGENT_COMMS_PORT: '',
+    });
+
+    expect(command).toContain('AGENT_COMMS_PERSONA');
+    expect(command).not.toContain('AGENT_COMMS_PORT');
+  });
+
+  it('drops any key outside the allowlist, so a secret cannot reach the command line', () => {
+    // A command line is readable by any local process. Passing a wider object
+    // must not widen what gets published, which is why the builder is driven by
+    // the allowlist rather than by the caller's keys.
+    const command = buildSpawnCommand('codex', 'demo-codex-2', '/tmp/brief.md', undefined, undefined, undefined, {
+      AGENT_COMMS_PERSONA: 'demo-codex-2',
+      ROUTER_SHARED_SECRET: 'hunter2',
+      SOME_FUTURE_TOKEN: 'leak-me',
+    } as CodexBridgeEnv);
+
+    expect(command).toContain('AGENT_COMMS_PERSONA');
+    expect(command).not.toContain('ROUTER_SHARED_SECRET');
+    expect(command).not.toContain('hunter2');
+    expect(command).not.toContain('leak-me');
   });
 
   it('does not add Codex MCP config overrides to Claude spawns', () => {

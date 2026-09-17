@@ -2,7 +2,7 @@
   "name": "agent-comms-vscode",
   "displayName": "Agent Orchestration",
   "description": "Coordinate Claude Code and OpenAI Codex agents via Slack from any VS Code workspace through a user-installed hub.",
-  "version": "0.2.50",
+  "version": "0.2.52",
   "publisher": "override-agency",
   "private": false,
   "engines": {
@@ -90,18 +90,23 @@
         "agentComms.codexQueueDelivery": {
           "type": "boolean",
           "default": true,
-          "description": "Deliver inbound pings to Codex agents with `codex queue` instead of typing into their terminal. The queued message reaches the session itself, so it survives a busy agent and an unfocused terminal. Terminal injection is still used as the fallback."
+          "description": "Deliver inbound pings to Codex agents with `codex queue`. The queued message reaches the session itself, so it survives a busy agent and an unfocused terminal. Turning this off leaves the websocket event as the only notification, unless agentComms.codexTerminalInjectionFallback is also on."
         },
         "agentComms.codexCliPath": {
           "type": "string",
           "default": "codex",
           "description": "Path to the Codex CLI used for queued delivery. Set an absolute path when `codex` is not on the extension host's PATH."
         },
+        "agentComms.codexTerminalInjectionFallback": {
+          "type": "boolean",
+          "default": false,
+          "description": "Retired. Typing a wake-up prompt into a Codex agent's terminal dropped messages whenever the terminal was not in a state to accept input, and `codex queue` replaces it. Turn this on only to fall back to terminal typing when a queued delivery cannot be confirmed."
+        },
         "agentComms.codexQueueConfirmMs": {
           "type": "number",
           "default": 8000,
           "minimum": 1000,
-          "description": "How long to wait for a queued ping to appear in the Codex session transcript before treating it as undelivered and falling back to terminal injection."
+          "description": "How long to wait for a queued ping to appear in the Codex session transcript before treating it as undelivered."
         },
         "agentComms.slackIconsBaseUrl": {
           "type": "string",

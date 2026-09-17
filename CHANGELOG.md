@@ -1,5 +1,11 @@
 # Changelog
 
+## 0.2.52
+
+- **Spawned Codex agents are addressable under their own name immediately.** Codex launches MCP servers with a sanitized environment, so the persona the hub set on the terminal never reached the agent-comms bridge. The bridge connected unnamed, the hub refused to route to the spawn-assigned name, and the agent silently missed pings until it called `agent_comms_rename` itself. The persona, port, and profile id now ride in through `mcp_servers.agent-comms.env`, which Codex does pass through. Verified by reading the bridge process environment: before, all three were absent; after, all three are present. The router secret is deliberately not passed this way, because the launch command line is readable by any local process; the bridge still reads it from `~/.agent-comms/.env`.
+- **Terminal prompt injection is retired.** It depended on the agent's terminal being in a state that accepts synthetic input, which is exactly why pings went missing. `codex queue` replaces it. `agentComms.codexTerminalInjectionFallback` (off by default) brings it back as an escape hatch. When a queued delivery cannot be confirmed the hub now says so in the output channel instead of typing into the terminal, and the ping still reaches the agent over the websocket.
+- The launch-command env builder is driven by an allowlist of three names, so passing it a wider object cannot widen what reaches the command line. Its test now passes a secret-bearing key and asserts the key is dropped, rather than passing a clean object and asserting nothing leaked.
+
 ## 0.2.50
 
 - **Codex inbound delivery no longer depends on the terminal.** Pings to a Codex agent are handed to the session with `codex queue --thread <id> --message <text>` instead of being typed into its VS Code terminal. An idle session picks the message up immediately; a busy session consumes it at the next turn boundary, so a working agent no longer loses pings. Measured on a live session: delivery confirmed 2.9s after queueing, and a message queued 0.1s into a 38s task was consumed 0.5s after that task finished.
