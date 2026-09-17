@@ -13,6 +13,7 @@ import { execFile } from 'node:child_process';
 import { readdir, open, readFile } from 'node:fs/promises';
 import { homedir } from 'node:os';
 import { join } from 'node:path';
+import { collectPidAncestry } from '../process-tree';
 
 export interface CodexSessionMeta {
   threadId: string;
@@ -27,6 +28,10 @@ export interface QueueRunResult {
 }
 
 export interface QueueDeliveryDeps {
+  /** The process and its ancestors, nearest first, so a bridge traces to its Codex session. */
+  ancestorPids(pid: number): Promise<number[]>;
+  /** Transcript files a process currently holds open. A Codex session holds its own. */
+  openRolloutPaths(pid: number): Promise<string[]>;
   listRolloutFiles(sessionsRoot: string): Promise<string[]>;
   /**
    * The whole first line of a transcript. It carries the session's base
@@ -47,6 +52,69 @@ export interface ResolveThreadInput {
   sessionsRoot: string;
   /** Clock skew allowance between agent registration and session start. */
   toleranceMs?: number;
+  /**
+   * The agent bridge's process id. Its Codex session is an ancestor, and that
+   * process holds its own transcript open, which identifies the thread exactly.
+   */
+  pid?: number;
+}
+
+const MAX_ANCESTOR_HOPS = 5;
+
+/**
+ * Walks up from the bridge process to the Codex session that owns it and reads
+ * the transcript that process has open.
+ *
+ * This is the only exact answer available. Matching on working directory picks
+ * the wrong session as soon as two agents share a directory, which is the normal
+ * case when several agents work in one repository.
+ */
+async function resolveThreadByProcess(
+  pid: number,
+  expectedCwd: string,
+  sessionsRoot: string,
+  deps: QueueDeliveryDeps,
+): Promise<ResolvedThread | null> {
+  let lineage: number[] = [];
+  try {
+    lineage = await deps.ancestorPids(pid);
+  } catch {
+    return null;
+  }
+
+  for (const current of lineage.slice(0, MAX_ANCESTOR_HOPS + 1)) {
+    let open: string[] = [];
+    try {
+      open = await deps.openRolloutPaths(current);
+    } catch {
+      continue;
+    }
+
+    // Only files under the sessions directory are transcripts, and newest first
+    // so a process holding several picks the live one.
+    const candidates = open
+      .filter((file) => file.startsWith(`${sessionsRoot}/`))
+      .sort()
+      .reverse();
+
+    for (const file of candidates) {
+      let head: string;
+      try {
+        head = await deps.readFirstLine(file);
+      } catch {
+        continue;
+      }
+
+      const meta = parseSessionMeta(head);
+      if (!meta || meta.cwd !== expectedCwd) {
+        continue;
+      }
+
+      return { threadId: meta.threadId, rolloutPath: file, startedAtMs: meta.startedAtMs };
+    }
+  }
+
+  return null;
 }
 
 export interface ResolvedThread {
@@ -128,22 +196,33 @@ export function parseSessionMeta(headText: string): CodexSessionMeta | null {
 }
 
 /**
- * Finds the newest Codex session started in the agent's working directory at or
- * after the agent registered. Sessions are keyed by cwd because that is the only
- * identifier shared between what the extension spawns and what Codex records.
+ * Finds the Codex session an agent owns.
+ *
+ * Preferred answer comes from the agent's process tree, which is exact. The
+ * directory scan behind it is a fallback for when that cannot be read, and it
+ * can only be trusted while one agent works in a directory.
  */
 export async function resolveThreadForAgent(
   input: ResolveThreadInput,
   deps: QueueDeliveryDeps,
 ): Promise<ResolvedThread | null> {
+  if (input.pid) {
+    const exact = await resolveThreadByProcess(input.pid, input.cwd, input.sessionsRoot, deps);
+    if (exact) {
+      return exact;
+    }
+  }
+
+  // Fallback for a session whose process tree cannot be read. It can only be
+  // trusted when one agent works in this directory.
   const tolerance = input.toleranceMs ?? DEFAULT_TOLERANCE_MS;
   const floor = input.notBeforeMs - tolerance;
   const files = await deps.listRolloutFiles(input.sessionsRoot);
 
-  // Transcript names carry their start time, so newest-first ordering lets the
-  // first match win. Metadata lines are large; reading every one of them to
-  // sort properly would cost megabytes per lookup.
+  // Transcript names carry their start time, so newest first. Metadata lines are
+  // large, so stop after a second candidate: two is already ambiguous.
   const newestFirst = [...files].sort().reverse();
+  const candidates: ResolvedThread[] = [];
 
   for (const file of newestFirst) {
     let head: string;
@@ -158,10 +237,15 @@ export async function resolveThreadForAgent(
       continue;
     }
 
-    return { threadId: meta.threadId, rolloutPath: file, startedAtMs: meta.startedAtMs };
+    candidates.push({ threadId: meta.threadId, rolloutPath: file, startedAtMs: meta.startedAtMs });
+    if (candidates.length > 1) {
+      break;
+    }
   }
 
-  return null;
+  // Two sessions in one directory means this fallback cannot tell them apart.
+  // Delivering to the wrong agent is worse than not delivering, so it declines.
+  return candidates.length === 1 ? candidates[0] : null;
 }
 
 export function parseQueuedMessageId(stdout: string): string | undefined {
@@ -363,7 +447,7 @@ export class CodexThreadIndex {
     }
 
     const thread = await resolveThreadForAgent(
-      { cwd: owner.cwd, notBeforeMs: owner.connectedAt, sessionsRoot },
+      { cwd: owner.cwd, notBeforeMs: owner.connectedAt, sessionsRoot, pid: owner.pid },
       deps,
     );
 
@@ -385,8 +469,37 @@ export class CodexThreadIndex {
   }
 }
 
+function runCapture(command: string, args: string[], timeoutMs: number): Promise<string> {
+  return new Promise((resolve) => {
+    execFile(command, args, { timeout: timeoutMs, windowsHide: true }, (_error, stdout) => {
+      resolve(stdout ?? '');
+    });
+  });
+}
+
+async function openRolloutPathsOnDisk(pid: number): Promise<string[]> {
+  // -Fn prints one path per line prefixed with 'n'.
+  const out = await runCapture('lsof', ['-a', '-p', String(pid), '-Fn'], 10_000);
+  const paths = new Set<string>();
+  for (const line of out.split('\n')) {
+    if (!line.startsWith('n')) {
+      continue;
+    }
+
+    const path = line.slice(1);
+    if (path.includes('/rollout-') && path.endsWith('.jsonl')) {
+      paths.add(path);
+    }
+  }
+
+  return [...paths];
+}
+
 export function createQueueDeliveryDeps(): QueueDeliveryDeps {
   return {
+    // Reuses the hub's existing ancestry walker: one `ps` call, with cycle detection.
+    ancestorPids: async (pid) => [...await collectPidAncestry(pid)],
+    openRolloutPaths: openRolloutPathsOnDisk,
     listRolloutFiles: listRolloutFilesOnDisk,
     readFirstLine: readFirstLineOnDisk,
     readText: (path) => readFile(path, 'utf8'),

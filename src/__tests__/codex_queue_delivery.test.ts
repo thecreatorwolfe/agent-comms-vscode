@@ -29,6 +29,8 @@ function userItemLine(text: string, timestamp: string): string {
 
 function makeDeps(overrides: Partial<QueueDeliveryDeps> = {}): QueueDeliveryDeps {
   return {
+    ancestorPids: vi.fn(async (pid: number) => [pid]),
+    openRolloutPaths: vi.fn(async () => []),
     listRolloutFiles: vi.fn(async () => []),
     readFirstLine: vi.fn(async () => ''),
     readText: vi.fn(async () => ''),
@@ -97,14 +99,31 @@ describe('resolveThreadForAgent', () => {
     readFirstLine: vi.fn(async (path: string) => heads[path] ?? ''),
   });
 
-  it('picks the newest session started in the agent working directory', async () => {
+  it('declines rather than guess when two sessions share the directory', async () => {
+    // Without a process tree there is nothing to tell two agents apart, and
+    // delivering to the wrong agent is worse than not delivering.
     const resolved = await resolveThreadForAgent(
       { cwd: CWD, notBeforeMs: Date.parse('2026-09-17T15:59:00.000Z'), sessionsRoot: '/sessions' },
       deps,
     );
 
-    expect(resolved?.threadId).toBe('thread-new');
-    expect(resolved?.rolloutPath).toBe(newer);
+    expect(resolved).toBeNull();
+  });
+
+  it('uses the single session in the directory when there is only one', async () => {
+    const only = '/sessions/2026/09/17/rollout-only.jsonl';
+    const resolved = await resolveThreadForAgent(
+      { cwd: CWD, notBeforeMs: Date.parse('2026-09-17T15:59:00.000Z'), sessionsRoot: '/sessions' },
+      makeDeps({
+        listRolloutFiles: vi.fn(async () => [only, otherCwd]),
+        readFirstLine: vi.fn(async (path: string) => ({
+          [only]: sessionMetaLine('thread-only', CWD, '2026-09-17T16:30:00.000Z'),
+          [otherCwd]: heads[otherCwd],
+        }[path] ?? '')),
+      }),
+    );
+
+    expect(resolved?.threadId).toBe('thread-only');
   });
 
   it('ignores sessions that started before the agent registered', async () => {
@@ -114,6 +133,76 @@ describe('resolveThreadForAgent', () => {
     );
 
     expect(resolved).toBeNull();
+  });
+
+  it('prefers the session the agent process actually owns', async () => {
+    // Two agents in one directory. Matching on directory alone would hand the
+    // ping to whichever started last, which is a misdelivery to a real peer.
+    const mine = '/sessions/2026/09/17/rollout-mine.jsonl';
+    const theirs = '/sessions/2026/09/17/rollout-zzz-newer.jsonl';
+    const open: Record<number, string[]> = { 4242: [], 900: [mine] };
+
+    const resolved = await resolveThreadForAgent(
+      { cwd: CWD, notBeforeMs: Date.parse('2026-09-17T15:00:00.000Z'), sessionsRoot: '/sessions', pid: 4242 },
+      makeDeps({
+        listRolloutFiles: vi.fn(async () => [mine, theirs]),
+        openRolloutPaths: vi.fn(async (pid: number) => open[pid] ?? []),
+        ancestorPids: vi.fn(async () => [4242, 900]),
+        readFirstLine: vi.fn(async (path: string) => ({
+          [mine]: sessionMetaLine('thread-mine', CWD, '2026-09-17T16:00:00.000Z'),
+          [theirs]: sessionMetaLine('thread-theirs', CWD, '2026-09-17T17:00:00.000Z'),
+        }[path] ?? '')),
+      }),
+    );
+
+    expect(resolved?.threadId).toBe('thread-mine');
+  });
+
+  it('ignores an open transcript belonging to another working directory', async () => {
+    const strayFile = '/sessions/2026/09/17/rollout-stray.jsonl';
+
+    const resolved = await resolveThreadForAgent(
+      { cwd: CWD, notBeforeMs: Date.parse('2026-09-17T18:00:00.000Z'), sessionsRoot: '/sessions', pid: 4242 },
+      makeDeps({
+        openRolloutPaths: vi.fn(async () => [strayFile]),
+        ancestorPids: vi.fn(async () => [4242]),
+        readFirstLine: vi.fn(async () => sessionMetaLine('thread-stray', '/somewhere/else', '2026-09-17T19:00:00.000Z')),
+      }),
+    );
+
+    expect(resolved).toBeNull();
+  });
+
+  it('ignores an open file that only looks like a transcript', async () => {
+    // A path outside the sessions directory is not a transcript, whatever it is
+    // named, so it is never read or used to address a session.
+    const readFirstLine = vi.fn(async () => sessionMetaLine('thread-fake', CWD, '2026-09-17T19:00:00.000Z'));
+
+    const resolved = await resolveThreadForAgent(
+      { cwd: CWD, notBeforeMs: Date.parse('2026-09-17T18:00:00.000Z'), sessionsRoot: '/sessions', pid: 4242 },
+      makeDeps({
+        openRolloutPaths: vi.fn(async () => ['/tmp/evil/rollout-planted.jsonl']),
+        ancestorPids: vi.fn(async () => [4242]),
+        readFirstLine,
+      }),
+    );
+
+    expect(resolved).toBeNull();
+    expect(readFirstLine).not.toHaveBeenCalled();
+  });
+
+  it('falls back to the directory scan when the process tree reveals nothing', async () => {
+    const resolved = await resolveThreadForAgent(
+      { cwd: CWD, notBeforeMs: Date.parse('2026-09-17T15:59:00.000Z'), sessionsRoot: '/sessions', pid: 4242 },
+      makeDeps({
+        listRolloutFiles: vi.fn(async () => [newer, otherCwd]),
+        readFirstLine: vi.fn(async (path: string) => heads[path] ?? ''),
+        openRolloutPaths: vi.fn(async () => []),
+        ancestorPids: vi.fn(async () => [4242]),
+      }),
+    );
+
+    expect(resolved?.threadId).toBe('thread-new');
   });
 });
 
