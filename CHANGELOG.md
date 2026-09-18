@@ -1,5 +1,11 @@
 # Changelog
 
+## 0.2.59
+
+- **Agents in one repository no longer fight over a persona.** A manually launched session derived its identity from its working directory alone, so every session in the same repo derived the same id and competed for one saved persona. The losers were left unreachable after a hub restart. Identity is now derived from the agent process that owns the bridge, using its pid and start time, so it stays stable across bridge and hub restarts while differing between sessions. Measured on live processes: 8 attached bridges produced 6 distinct ids, the two collisions being pairs of bridges inside the same session, where sharing is correct. Previously all 8 shared one id.
+- **A bridge refused a persona now recovers instead of looping.** Every tool call sits behind auth, so a session retrying a name another session holds stayed dark and could not even rename itself. After a second refusal it gives the name up, connects under a temporary persona, and asks for registration.
+- Neither lookup asks `ps` for the tty column, which on some machines takes minutes to return.
+
 ## 0.2.58
 
 - **Fixed a process listing that could hang the hub.** Asking `ps` for the tty column never returns on this machine, and the hub's terminal matching asked for it on every lookup, so that path stalled indefinitely. This is the most likely reason terminal wake-ups went missing. Parent lookups no longer request tty at all, the terminal query is separate and time-boxed, and a stall now degrades to "no terminal data" instead of blocking. Measured after the fix: ancestry 60ms where it previously never returned.

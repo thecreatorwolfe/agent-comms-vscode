@@ -16,7 +16,7 @@ import {
   renamePersonaForReply,
 } from './reply';
 import { fetchSelfAgentStatus, formatAgentConnectionSnapshot, formatAgentStatus } from './status';
-import { resolveBridgeEnv } from './runtime-env';
+import { resolveBridgeEnv, resolveBridgeProfileId } from './runtime-env';
 import { AgentCommsWsClient } from './ws-client';
 import { refineSpawnEffort, refineSpawnModel, SPAWN_MODEL_PARAM_DESCRIPTION , SPAWN_EFFORT_PARAM_DESCRIPTION } from '../spawn-model';
 
@@ -39,7 +39,10 @@ async function main(): Promise<void> {
     logFilePrefix: 'codex-bridge',
   });
 
-  const { port, secret, claimedPersona, profileId, pid } = bridgeEnv;
+  const { port, secret, claimedPersona, pid } = bridgeEnv;
+  // A manual session's id is derived from the agent process that owns this
+  // bridge, so two sessions in one directory do not fight over one persona.
+  const profileId = await resolveBridgeProfileId();
 
   const server = new McpServer(
     { name: 'agent-comms-codex', version: '0.0.1' },

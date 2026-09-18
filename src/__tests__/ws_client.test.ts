@@ -300,3 +300,51 @@ describe('AgentCommsWsClient waitForAuth', () => {
     expect(close).toHaveBeenCalledWith(4009, 'persona_mismatch');
   });
 });
+
+describe('AgentCommsWsClient persona conflict recovery', () => {
+  function makeClient() {
+    return new AgentCommsWsClient({
+      kind: 'codex',
+      port: 47592,
+      secret: 'secret',
+      cwd: '/tmp/project',
+      persona: 'taken-by-someone-else-1',
+    }) as AgentCommsWsClient & {
+      handleIncoming: (raw: string) => Promise<void>;
+      persona?: string;
+      registrationRequired: boolean;
+    };
+  }
+
+  const conflict = JSON.stringify({ type: 'auth.error', reason: 'persona_conflict' });
+
+  it('keeps the name after a single refusal, which may be a shutdown race', async () => {
+    const client = makeClient();
+
+    await client.handleIncoming(conflict);
+
+    expect(client.persona).toBe('taken-by-someone-else-1');
+  });
+
+  it('gives the name up after a second refusal so the session can connect', async () => {
+    // Every tool call sits behind auth, so a session that keeps retrying a name
+    // it cannot have stays dark and cannot even rename itself.
+    const client = makeClient();
+
+    await client.handleIncoming(conflict);
+    await client.handleIncoming(conflict);
+
+    expect(client.persona).toBeUndefined();
+    expect(client.registrationRequired).toBe(true);
+  });
+
+  it('does not surrender the name for an unrelated auth failure', async () => {
+    const client = makeClient();
+    const badSecret = JSON.stringify({ type: 'auth.error', reason: 'invalid_secret' });
+
+    await client.handleIncoming(badSecret);
+    await client.handleIncoming(badSecret);
+
+    expect(client.persona).toBe('taken-by-someone-else-1');
+  });
+});

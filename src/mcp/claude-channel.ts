@@ -17,7 +17,7 @@ import {
 } from './reply';
 import { fetchSelfAgentStatus, formatAgentConnectionSnapshot, formatAgentStatus } from './status';
 import { MAX_BODY_LENGTH } from '../schema/slack_message';
-import { resolveBridgeEnv } from './runtime-env';
+import { resolveBridgeEnv, resolveBridgeProfileId } from './runtime-env';
 import { AgentCommsWsClient } from './ws-client';
 import { refineSpawnEffort, refineSpawnModel, SPAWN_MODEL_PARAM_DESCRIPTION , SPAWN_EFFORT_PARAM_DESCRIPTION } from '../spawn-model';
 

@@ -67,6 +67,13 @@ export function formatOutboundErrorMessage(
   ].join('');
 }
 
+/**
+ * How many refusals to accept before giving up a claimed persona. One can be a
+ * race with a session still shutting down; a second means the name is genuinely
+ * someone else's.
+ */
+const PERSONA_CONFLICT_SURRENDER_ATTEMPTS = 2;
+
 export class AgentCommsWsClient {
   private readonly options: AgentCommsWsClientOptions;
   private ws: WebSocket | undefined;
@@ -102,6 +109,7 @@ export class AgentCommsWsClient {
   private connectionState: AgentCommsWsConnectionSnapshot['state'] = 'connecting';
   private personaSource: AuthAckFrame['persona_source'] | undefined;
   private registrationRequired = false;
+  private personaConflicts = 0;
   private hasAuthenticatedOnce = false;
   private disconnectNoticeShown = false;
 
@@ -393,6 +401,7 @@ export class AgentCommsWsClient {
         this.connectionState = 'connected';
         this.persona = frame.persona;
         this.personaSource = frame.persona_source;
+        this.personaConflicts = 0;
         this.registrationRequired = frame.registration_required;
         this.lastConnectionError = undefined;
         this.startHeartbeat();
@@ -428,6 +437,24 @@ export class AgentCommsWsClient {
         this.connectionState = 'reconnecting';
         this.options.logger?.warn({ frame }, 'extension returned an auth error frame');
         this.options.logger?.warn(`Hub auth failed: ${frame.reason}. Reconnecting.`);
+        if (frame.reason === 'persona_conflict') {
+          this.personaConflicts += 1;
+          // Another live session holds this name. Retrying with it can never
+          // succeed, and every tool call is blocked behind auth, so the session
+          // would stay dark and unable to rename itself. Give the name up and
+          // reconnect unnamed; the hub issues a temporary persona and asks for
+          // registration, which a rename can then complete.
+          if (this.personaConflicts >= PERSONA_CONFLICT_SURRENDER_ATTEMPTS && this.persona) {
+            this.options.logger?.warn(
+              `Persona ${this.persona} is held by another live session. Reconnecting without it; `
+              + 'register with agent_comms_rename to claim a name.',
+            );
+            this.persona = undefined;
+            this.personaSource = undefined;
+            this.registrationRequired = true;
+          }
+        }
+
         return;
       case 'profile.reset':
         this.persona = frame.persona;
