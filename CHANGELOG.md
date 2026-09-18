@@ -1,5 +1,9 @@
 # Changelog
 
+## 0.2.60
+
+- **Security: settings that name an executable or a secret file are now machine scope.** `agentComms.codexCliPath` is passed to `execFile`, and `agentComms.envFilePath` points at the file holding the router secret. Both defaulted to window scope, so any repository's `.vscode/settings.json` could set them and opening an untrusted repo was enough to run a chosen binary. Found by the pre-push security review.
+
 ## 0.2.59
 
 - **Agents in one repository no longer fight over a persona.** A manually launched session derived its identity from its working directory alone, so every session in the same repo derived the same id and competed for one saved persona. The losers were left unreachable after a hub restart. Identity is now derived from the agent process that owns the bridge, using its pid and start time, so it stays stable across bridge and hub restarts while differing between sessions. Measured on live processes: 8 attached bridges produced 6 distinct ids, the two collisions being pairs of bridges inside the same session, where sharing is correct. Previously all 8 shared one id.

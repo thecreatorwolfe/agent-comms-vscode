@@ -2,7 +2,7 @@
   "name": "agent-comms-vscode",
   "displayName": "Agent Orchestration",
   "description": "Coordinate Claude Code and OpenAI Codex agents via Slack from any VS Code workspace through a user-installed hub.",
-  "version": "0.2.59",
+  "version": "0.2.60",
   "publisher": "override-agency",
   "private": false,
   "engines": {
@@ -57,7 +57,8 @@
         "agentComms.envFilePath": {
           "type": "string",
           "default": "${userHome}/.agent-comms/.env",
-          "description": "Path to the Agent Comms env file. Set this in User settings for machine-wide use."
+          "description": "Path to the Agent Comms env file. Set this in User settings for machine-wide use. Machine scope: a workspace cannot override this, because the value is executed or read for the hub secret.",
+          "scope": "machine"
         },
         "agentComms.port": {
           "type": "number",
@@ -95,7 +96,8 @@
         "agentComms.codexCliPath": {
           "type": "string",
           "default": "codex",
-          "description": "Path to the Codex CLI used for queued delivery. Set an absolute path when `codex` is not on the extension host's PATH."
+          "description": "Path to the Codex CLI used for queued delivery. Set an absolute path when `codex` is not on the extension host's PATH. Machine scope: a workspace cannot override this, because the value is executed or read for the hub secret.",
+          "scope": "machine"
         },
         "agentComms.codexTerminalInjectionFallback": {
           "type": "boolean",
