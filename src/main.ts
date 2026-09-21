@@ -21,6 +21,7 @@ import {
   createQueueDeliveryDeps,
   deliverViaQueue,
 } from './codex/queue-delivery';
+import { relayTextToAgent } from './codex/agent-message';
 import { SpawnedTerminalRegistry } from './registry/terminals';
 import { GatewayHttpServer } from './gateway/http';
 import { WsGateway } from './gateway/ws';
@@ -502,9 +503,19 @@ async function wakeCodexAgent(
           return 'queue';
         }
 
+        if (outcome.stage === 'confirm') {
+          // The CLI took it; it is pending in the session. Typing it into the
+          // terminal as well is how a lane reads the same ping twice.
+          outputChannel.appendLine(
+            `[agent-comms] codex queue delivery to ${targetAgent.persona} (thread ${thread.threadId}) accepted but unconfirmed: `
+            + `${outcome.reason}; NOT falling back — the message is already queued and injecting would duplicate it`,
+          );
+          return 'queue';
+        }
+
         codexThreadIndex.forget(targetAgent.persona);
         outputChannel.appendLine(
-          `[agent-comms] codex queue delivery to ${targetAgent.persona} (thread ${thread.threadId}) not confirmed: ${outcome.reason}; falling back to terminal injection`,
+          `[agent-comms] codex queue delivery to ${targetAgent.persona} (thread ${thread.threadId}) refused by the CLI: ${outcome.reason}; falling back to terminal injection`,
         );
       }
     } catch (error) {
@@ -1544,6 +1555,33 @@ export async function bootstrap(
     ),
     onReadSlack: async (request) => handleReadSlackHistory(slackRuntime, env, request),
     onRename: async (request) => handleRenameRequest(request, registry, terminals, wsGateway, profileStore, outputChannel),
+    onAgentMessage: async (request) => {
+      const result = await relayTextToAgent(
+        {
+          persona: request.persona,
+          text: request.text,
+          sender: request.sender ?? null,
+          confirmTimeoutMs: request.confirm_timeout_ms ?? null,
+        },
+        {
+          // registry.get() still returns an agent inside its disconnect grace
+          // window; list() is the one that excludes them. A lane that has gone
+          // must be a refusal, not a queue write nobody will read.
+          findAgent: (persona) => registry.list().find((agent) => agent.persona === persona),
+          threadIndex: codexThreadIndex,
+          queueDeps: codexQueueDeps,
+          sessionsRoot: codexSessionsRoot(),
+          cliPath: vscode.workspace.getConfiguration('agentComms').get<string>('codexCliPath') || 'codex',
+          defaultSender: 'Nick, relayed by Soph',
+          newDeliveryId: () => randomUUID().slice(0, 8),
+        },
+      );
+      outputChannel.appendLine(
+        `[agent-comms] relayed ${result.text_chars} chars to ${result.persona} `
+        + `(thread ${result.thread_id}, ${result.delivery}, lane was ${result.activity})`,
+      );
+      return result;
+    },
   });
 
   wsGateway = new WsGateway({
