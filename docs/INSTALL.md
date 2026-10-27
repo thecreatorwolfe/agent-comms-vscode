@@ -4,7 +4,7 @@
 
 - Node 22+
 - VS Code 1.85+
-- Slack App credentials already created for `#agent-communication`
+- Slack App credentials, and a channel the bot has been invited to
 - Claude Code and Codex installed locally
 
 ## Setup
@@ -21,7 +21,7 @@
    SLACK_APP_TOKEN=xapp-...
    SLACK_BOT_TOKEN=xoxb-...
    SLACK_SIGNING_SECRET=...
-   SLACK_CHANNEL_ID=C0ASSA3BBGC
+   SLACK_CHANNEL_ID=C0123456789
    SLACK_OPERATOR_USER_ID=U...
    ROUTER_SHARED_SECRET=...
    EXTENSION_PORT=47592
@@ -73,7 +73,7 @@
 - The spawned terminal flow also injects a stable `AGENT_COMMS_PROFILE_ID`, which lets the hub reconnect that session to its saved Slack persona after a restart.
 - If you want per-agent Slack avatars, set `agentComms.slackIconsBaseUrl` in VS Code User settings to a public URL that serves this repo's `icons/` directory. Leave it blank if you prefer the Slack app's default avatar.
 - Human Slack control is intentionally narrow: `@Agent Comms stop` or `/agent-comms stop` sends an interrupt-like escape to all tracked live agent terminals, and `@Agent Comms stop kill` or `/agent-comms stop kill` disposes those terminals.
-- `@Agent Comms listen` or `/agent-comms listen` lets Nick's normal channel messages relay at high priority. Explicit `@persona` or `@ALL` recipients override routing; otherwise the hub fans the message out to all currently active agents. `@Agent Comms unlisten` or `/agent-comms unlisten` disables that relay again.
+- `@Agent Comms listen` or `/agent-comms listen` lets the operator's normal channel messages relay at high priority. Explicit `@persona` or `@ALL` recipients override routing; otherwise the hub fans the message out to all currently active agents. `@Agent Comms unlisten` or `/agent-comms unlisten` disables that relay again.
 - `@Agent Comms see profiles` or `/agent-comms see profiles` prints the live active, idle, disconnected, reserved, and saved profile inventory so you can see exactly which names are occupied.
 - `@Agent Comms clear disconnected` or `/agent-comms clear disconnected` drops every disconnected grace-period profile in one sweep without touching any live terminal.
 - `@Agent Comms clear invalidated` or `/agent-comms clear invalidated` clears the invalidated profile-id store and sweeps saved/reserved/disconnected `unregistered-*` occupancy in one pass without touching live terminals.

@@ -23,8 +23,8 @@ User-level config points Claude and Codex at stable launcher scripts under `~/.a
 
 ## Message flow
 
-1. Nick mentions the Slack app in `#agent-communication`.
-2. The extension receives `app_mention` through Socket Mode.
+1. The operator or an agent posts in the configured Slack channel.
+2. The extension receives the message through Socket Mode, or through the 5-second `conversations.history` poll if Socket Mode delivered it to a different connection.
 3. `src/slack/parse.ts` resolves recipients from inline `@persona` tokens or the explicit bracketed protocol header.
 4. `src/gateway/ws.ts` emits one `event` frame per matching live agent.
 5. Claude or Codex bridge processes forward the event into their local session.
