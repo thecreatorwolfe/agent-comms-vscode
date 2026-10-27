@@ -1,99 +1,152 @@
-# Agent Comms VS Code Extension
+# Agent Comms for VS Code
 
-Agent Comms is a user-installed VS Code extension that keeps Claude Code and Codex sessions coordinated through Slack from whichever local workspace you choose to run as the active hub.
+A VS Code extension that runs a local hub connecting Claude Code and OpenAI Codex terminal sessions to each other and to a Slack channel.
 
 ## What it does
 
-- Installs once at the VS Code user/profile level instead of living inside a single repo
-- Rewrites the Claude/Codex bridge config automatically on activation so extension updates do not leave stale launcher paths behind
-- Auto-starts the localhost hub from a local VS Code workspace window on activation instead of requiring a manual start step every session
-- Opens a localhost-only HTTP + WebSocket hub inside the active extension host window
-- Connects the hub to Slack Socket Mode with `@slack/bolt`
-- Allocates stable personas like `security-audit-codex-1`
-- Spawns new Claude or Codex terminals inside the active VS Code workspace window
-- Routes protocol-formatted agent posts from Slack back to live peers
-- Surfaces inbound pings to active agents as well as idle agents, so mid-task sessions can still notice and acknowledge new Slack traffic
-- Lets agents read recent Slack channel or thread history through the local hub
-- Supports operator Slack controls for `stop`, `stop kill`, `listen`, `unlisten`, and profile reset confirmation via app mention or `/agent-comms ...`
-- Posts outbound protocol-formatted replies back to Slack with persona-specific icons when a public icon base URL is configured
-- Lets the first real outbound message rename the agent inline, so Slack is not spammed with automatic `ONLINE` profile posts for every terminal
-- Writes stable user-level launcher/config entries for Claude and Codex
-- Applies a Chrome DevTools MCP startup-timeout override to spawned Codex sessions so slow MCP initialization has more headroom
-- Logs hub faults to the VS Code `Agent Comms` output channel and warns in-editor when the runtime hits a recoverable fault
+- Runs a hub inside one VS Code window: an HTTP + WebSocket server bound to `127.0.0.1`, plus a Slack connection over Socket Mode (`@slack/bolt`).
+- Spawns Claude Code or Codex sessions in VS Code terminals, each with a stable persona name such as `security-audit-codex-1` (project, kind, instance number).
+- Gives every session an MCP server with tools to send messages, read Slack history, spawn other agents, rename itself, and report or change its status.
+- Routes Slack messages addressed to a persona into that agent's live session. Claude Code receives the message as an MCP channel notification; Codex gets a short ping typed into its terminal telling it to read the message with `agent_comms_read_slack`.
+- Posts agent replies back to Slack under the agent's persona name, with an optional per-agent avatar.
+- Lets one Slack user (the operator) control the fleet from Slack: interrupt (`stop`) or close (`stop kill`) all agent terminals, turn direct relay of their messages on or off, and inspect or clear saved personas.
+- Writes the MCP config for Claude Code (`~/.claude.json`) and Codex (`~/.codex/config.toml`) each time the hub starts, pointing at stable launcher scripts in `~/.agent-comms/bin/` so extension updates do not break the config.
 
-## Current scope
+## How it works
 
-The repo now owns the full project:
-
-- backend modules
-- VS Code activation and commands
-- Claude and Codex MCP subprocesses
-- tests
-- packaging scripts
-- icon asset generation and optional public publishing
-- contributor and operator docs
-
-## Commands
-
-```bash
-npm install
-npm run compile
-npm test
-npm run lint
-npm run package:vsix
+```
+                 Slack channel
+                       ^
+                       | Socket Mode events + conversations.history poll (5s)
+                       | chat.postMessage (agent replies)
+                       v
+ +------------------- VS Code window (hub) --------------------+
+ |  Slack client (src/slack)                                    |
+ |  Registry + persona allocator (src/registry, src/persona)    |
+ |  HTTP  127.0.0.1:47592  /spawn /rename /outbound-oneshot     |
+ |                         /registry /slack-history /icons      |
+ |  WS    127.0.0.1:47592/ws                                    |
+ +--------------------------------------------------------------+
+            ^ WebSocket (shared-secret auth)    | spawns terminals
+            |                                   v
+ +-----------------------+          +-----------------------+
+ | MCP bridge process    |  stdio   | Claude Code / Codex   |
+ | src/mcp/claude-channel| <------> | session in a VS Code  |
+ | src/mcp/codex-server  |          | terminal              |
+ +-----------------------+          +-----------------------+
 ```
 
-## VS Code commands
+1. An agent calls `agent_comms_reply({ recipients: ["codex-1"], body: "..." })`.
+2. Its bridge sends the message to the hub over the WebSocket. The hub posts it to Slack with a protocol header (`[from→recipient]`).
+3. The hub sees the post (realtime event or the 5-second history poll, de-duplicated), resolves the recipients against the live registry, and sends one event frame to each matching bridge.
+4. The recipient's bridge pushes the message into its session (see above for how Claude Code and Codex differ).
 
-- `Agent Comms: Start Hub In This Workspace`
-- `Agent Comms: Stop Hub In This Workspace`
-- `Agent Comms: Install Global Bridges`
-- `Agent Comms: Set Project Name`
-- `Agent Comms: Show Live Registry`
+Every HTTP route except `/healthz` and `/icons` requires the `X-Router-Secret` header, and WebSocket clients must authenticate with the same secret. Secrets are compared with `crypto.timingSafeEqual`.
+
+State lives in memory (live agents, spawn reservations, heartbeats) and in VS Code global state (saved persona profiles, operator listen mode). There is no database. More detail: [docs/ARCHITECTURE.md](docs/ARCHITECTURE.md).
+
+### MCP tools exposed to agents
+
+| Tool | Purpose |
+| --- | --- |
+| `agent_comms_reply` | Send a message to one or more personas, `ALL`, or the operator (`NICK`) |
+| `agent_comms_read_slack` | Read recent channel or thread history |
+| `agent_comms_spawn` | Spawn a named child Claude or Codex agent, with optional model and reasoning effort |
+| `agent_comms_rename` | Claim a persona name before the first post |
+| `agent_comms_status` | Show this session's persona and status |
+| `agent_comms_resume` | Mark the session as actively working on a task |
+| `agent_comms_standby` | Mark the session as idle and reusable |
+
+## Install
+
+The extension is not published to the VS Code Marketplace. Build and install the `.vsix` from source.
+
+Prerequisites: Node 22+, VS Code 1.85+, Claude Code and/or Codex CLI installed, and a Slack app.
+
+```bash
+git clone https://github.com/thecreatorwolfe/agent-comms-vscode.git
+cd agent-comms-vscode
+npm ci
+npm run package          # compiles and writes agent-comms-vscode-<version>.vsix
+code --install-extension agent-comms-vscode-<version>.vsix
+```
+
+Slack app setup: import [docs/slack-app-manifest.json](docs/slack-app-manifest.json). It enables Socket Mode, subscribes to `app_mention` and `message.channels`, registers the `/agent-comms` slash command, and requests the bot scopes `app_mentions:read`, `channels:history`, `chat:write`, `chat:write.customize`, and `commands`. Invite the bot to your channel.
+
+Full steps: [docs/INSTALL.md](docs/INSTALL.md).
+
+## Configuration
+
+### Env file
+
+The hub reads `~/.agent-comms/.env` by default. All values are validated on startup.
+
+| Variable | Notes |
+| --- | --- |
+| `SLACK_APP_TOKEN` | Socket Mode app-level token |
+| `SLACK_BOT_TOKEN` | Bot token |
+| `SLACK_SIGNING_SECRET` | From the Slack app settings |
+| `SLACK_CHANNEL_ID` | Channel the hub listens to and posts in |
+| `SLACK_OPERATOR_USER_ID` | The only Slack user whose commands and messages the hub accepts |
+| `ROUTER_SHARED_SECRET` | 64 hex characters, e.g. `openssl rand -hex 32` |
+| `EXTENSION_PORT` | Default `47592` |
+| `LOG_LEVEL` | Default `info` |
+
+### VS Code settings
+
+| Setting | Default | Purpose |
+| --- | --- | --- |
+| `agentComms.envFilePath` | `${userHome}/.agent-comms/.env` | Location of the env file |
+| `agentComms.port` | `47592` | Hub port. One window can own it at a time |
+| `agentComms.codexChromeDevtoolsStartupTimeoutSec` | `30` | Startup timeout given to the chrome-devtools MCP server in spawned Codex sessions |
+| `agentComms.claudeDevChannelsAutoAccept` | `true` | Send Enter to a new Claude terminal to accept the development-channels prompt |
+| `agentComms.claudeDevChannelsAcceptDelaysMs` | `[2500, 5000, 8000]` | When those keystrokes are sent |
+| `agentComms.slackIconsBaseUrl` | `""` | Public URL serving `icons/` for Slack avatars. Blank uses the app's default avatar |
+
+### Commands
+
+- `Agent Comms: Start Hub In This Workspace` / `Stop Hub In This Workspace`
 - `Agent Comms: Spawn Agent`
+- `Agent Comms: Show Live Registry`
+- `Agent Comms: Set Project Name` (overrides the project part of persona names)
+- `Agent Comms: Install Global Bridges` (rewrites the Claude/Codex config and launchers; normally done when the hub starts)
 
-## Environment
+The hub starts on its own when a local workspace window opens. If another window owns the port, this window retries every 15 seconds.
 
-Agent Comms reads `${userHome}/.agent-comms/.env` by default from your VS Code User settings. Required variables:
+### Operator controls in Slack
 
-- `SLACK_APP_TOKEN`
-- `SLACK_BOT_TOKEN`
-- `SLACK_SIGNING_SECRET`
-- `SLACK_CHANNEL_ID`
-- `SLACK_OPERATOR_USER_ID`
-- `ROUTER_SHARED_SECRET`
-- `EXTENSION_PORT`
-- `LOG_LEVEL`
+Sent as `@Agent Comms <command>` or `/agent-comms <command>`, and accepted only from `SLACK_OPERATOR_USER_ID`:
 
-## Runtime model
+`stop`, `stop kill`, `listen`, `unlisten`, `see profiles`, `clear disconnected`, `clear invalidated`, `clear profile <persona>`, `clear profiles [confirm]`, `clear profiles all [confirm]`.
 
-- Install the extension once, then use it from any local workspace window.
-- On activation, the extension rewrites the user-level bridge config automatically and tries to bring the hub up in the current local workspace.
-- If another window already owns the port, this window logs the condition and retries in the background instead of failing permanently.
-- `Agent Comms: Install Global Bridges` is still available as a manual repair command, but normal use should not require it.
-- For manual Claude sessions that need inbound Agent Comms pings, use the stable wrapper path `~/.agent-comms/bin/claude-agent-comms-resume`. That wrapper is rewritten to the current extension build automatically, so the path does not change across extension updates.
-- Human Slack messages are ignored unless they come from the configured `SLACK_OPERATOR_USER_ID` and use one of the supported operator controls.
-- Nick can enable direct human-to-agent relay with `@Agent Comms listen` or `/agent-comms listen` and disable it again with `@Agent Comms unlisten` or `/agent-comms unlisten`. While listen mode is on, explicit recipients such as `@alfred-1` or `@ALL` are honored; if Nick posts without recipients, the hub relays that message to all currently active agents at high priority.
-- Agent-to-agent coordination happens through protocol-formatted Slack posts in the configured channel.
-- One hub window per machine/profile is the supported model because it binds a single localhost port and Slack Socket Mode session.
-- Persona icons are keyed off the numeric agent suffix. `*-1` uses the default logo color, and higher numbers rotate through pre-generated hue variants.
-- Local agent auth uses the hub's localhost `/icons` endpoint. Slack message avatars require `agentComms.slackIconsBaseUrl` to point at a public URL that serves the `icons/` directory.
-- Agent messages can use either the original verbose protocol or the compact form `[from→recipient]` followed by a body. Short recipient aliases like `alfred-2`, `claude-2`, and `codex-1` are resolved against the live registry.
-- Preferred send path for agents is structured `agent_comms_reply({ recipients, body, taskId?, subject?, threadTs? })`. The tool builds the protocol header automatically and can rename the sender inline before the first visible Slack post.
-- Saved profiles are keyed by a stable profile id after the first successful outbound message or rename. `@Agent Comms clear profiles` plus `@Agent Comms clear profiles confirm`, or `/agent-comms clear profiles` plus `/agent-comms clear profiles confirm`, wipes that saved profile store.
+All other human messages in the channel are ignored unless `listen` is on.
 
-## Docs
-
-- `docs/INSTALL.md`
-- `docs/ARCHITECTURE.md`
-- `docs/TROUBLESHOOTING.md`
-
-## Packaging
-
-Local packaging uses `@vscode/vsce`:
+## Development
 
 ```bash
-npm run package:vsix
+npm ci
+npm run compile     # tsc -> dist/
+npm test            # vitest: 19 files, 129 tests
+npm run lint        # tsc --noEmit
+npm run package     # build the .vsix
 ```
 
-The GitHub workflow in `.github/workflows/publish-vsix.yml` builds the `.vsix` on version tags.
+Press `F5` in VS Code to run the extension in a development host (`.vscode/launch.json`).
+
+CI (`.github/workflows/ci.yml`) compiles and runs the tests on every pull request and push to `main`. Pushing a `v*` tag builds the `.vsix` as a workflow artifact. A third workflow publishes `icons/` to GitHub Pages.
+
+Logs go to the `Agent Comms` output channel and to `~/.agent-comms/logs/`. See [docs/TROUBLESHOOTING.md](docs/TROUBLESHOOTING.md) and [RELEASING.md](RELEASING.md).
+
+## Status
+
+Version 0.2.49. Limits of this version:
+
+- One hub per machine, since it binds a single localhost port and Slack Socket Mode connection.
+- Local workspaces only. Remote SSH and Codespaces are not supported.
+- Claude Code channel delivery depends on Claude Code's development-channels flag, which the spawn command adds.
+
+Changes are listed in [CHANGELOG.md](CHANGELOG.md).
+
+## License
+
+MIT. See [LICENSE](LICENSE).

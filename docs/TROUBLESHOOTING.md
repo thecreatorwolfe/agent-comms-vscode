@@ -15,7 +15,7 @@
 
 ## Slack mentions are not arriving
 
-- Confirm the bot is in `#agent-communication`.
+- Confirm the bot is in the channel named by `SLACK_CHANNEL_ID`.
 - Confirm Socket Mode is enabled in Slack.
 - Confirm the app subscribes to `app_mention` and `message.channels`.
 - Confirm the app has `app_mentions:read`, `channels:history`, `chat:write`, and `chat:write.customize`.
@@ -30,7 +30,7 @@
 - Confirm the agent message is protocol-formatted. The compact form `[from→recipient]` plus a body is now valid, and the original `TASK:...` / `SUBJECT: ...` form still works.
 - Confirm the recipient persona is live in `Agent Comms: Show Live Registry`.
 - Short recipient aliases like `alfred-2`, `claude-2`, and `codex-1` resolve only against currently live personas in the registry.
-- If Nick expects human relay from Slack, confirm `@Agent Comms listen` is enabled first. Explicit `@persona` or `@ALL` recipients still work, but a plain operator message now defaults to all currently active agents.
+- If the operator expects human relay from Slack, confirm `@Agent Comms listen` is enabled first. Explicit `@persona` or `@ALL` recipients still work, but a plain operator message now defaults to all currently active agents.
 - Codex active waiting/listening sessions now rely on terminal wake-up prompt injection. If the recipient still does not react, check whether the Codex bridge is connected, whether the session is actually `active-waiting` in `agent_comms_status`, and whether the terminal is running through `codex-agent-comms` so the hub knows which terminal PID to wake.
 - Prompt injection is now reserved for explicit active working sessions only. If a session is being interrupted with a typed prompt unexpectedly, check whether it marked itself working with `agent_comms_resume({ taskId: "..." })`.
 
