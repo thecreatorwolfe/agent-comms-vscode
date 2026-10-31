@@ -197,6 +197,11 @@ describe('locating the Claude session behind a bridge', () => {
     expect((await locateClaudeSession(LANE.persona, 5001, base(files, [5001, 5000])))?.sessionId).toBe('by-pid');
   });
 
+  it('never adopts a Claude session further up the tree than the bridge\'s parent', async () => {
+    const files = { [`${HOME}/sessions/9000.json`]: JSON.stringify({ sessionId: 'grandparent', cwd: '/a', name: 'other' }) };
+    expect(await locateClaudeSession(LANE.persona, 5001, base(files, [5001, 5000, 9000]))).toBeNull();
+  });
+
   it('falls back to the launch name, and only when exactly one session carries it', async () => {
     const one = { [`${HOME}/sessions/7000.json`]: JSON.stringify({ sessionId: 'by-name', cwd: '/a', name: LANE.persona }) };
     expect((await locateClaudeSession(LANE.persona, 5001, base(one, [5001])))?.sessionId).toBe('by-name');

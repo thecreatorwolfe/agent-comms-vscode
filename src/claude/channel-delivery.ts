@@ -81,6 +81,8 @@ const ACK_TIMEOUT_MS = 3_000;
 // boundary; past this window the honest answer is 'queued', not a failure.
 const DEFAULT_CONFIRM_TIMEOUT_MS = 8_000;
 const CONFIRM_POLL_MS = 400;
+// Bridge itself, then its parent (the Claude Code process).
+const MAX_SESSION_HOPS = 2;
 
 export function claudeHomeDir(env: NodeJS.ProcessEnv = process.env, home = os.homedir()): string {
   return env.CLAUDE_CONFIG_DIR?.trim() || path.join(home, '.claude');
@@ -124,7 +126,9 @@ export async function locateClaudeSession(
   const sessionsDir = path.join(deps.claudeHome, 'sessions');
   let lineage: number[] = [];
   try { lineage = await deps.ancestorPids(pid); } catch { lineage = []; }
-  for (const candidate of lineage) {
+  // The bridge is Claude Code's direct child. Looking further up could land on
+  // an unrelated Claude session that launched this lane's terminal.
+  for (const candidate of lineage.slice(0, MAX_SESSION_HOPS)) {
     const record = parseSessionRecord(await deps.readText(path.join(sessionsDir, `${candidate}.json`)), candidate);
     if (record) return record;
   }
