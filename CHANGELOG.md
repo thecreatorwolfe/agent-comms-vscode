@@ -1,5 +1,15 @@
 # Changelog
 
+## 0.2.63
+
+- `POST /agent-message` now reaches Claude lanes too. A Claude lane gets one `event` frame down its own bridge
+  socket (the route Slack pings already take) and Claude Code queues it as channel input: a lane mid-turn finishes
+  its current step untouched and reads the message with the next tool result; an idle lane takes it at once.
+  The gateway waits for the bridge's surface ack, then confirms by finding the delivery marker in the session
+  transcript (session found from the bridge's process tree, else by launch name, else by the one fresh transcript
+  in the lane's project folder). Results: `confirmed`, `queued`, or `unacknowledged` (frame written, no ack);
+  never retried. Bridges already running from 0.2.62 work unchanged; no lane restart is needed.
+
 ## 0.2.62
 
 - **Corrected when a queued message actually lands.** Four session rollouts show a queued message entering the transcript at the TURN BOUNDARY, not on arrival; the earlier comment claimed an immediate write and was wrong. A confirmation means the lane has taken the text, and how long that takes is set by the turn in flight. A lane mid-way through a long turn now honestly reports `queued` rather than the window being shortened to make confirmations look faster.

@@ -71,10 +71,14 @@ export interface AgentMessageResult {
   kind: string;
   /** What the lane was doing when the text was handed over. */
   activity: string;
-  /** 'confirmed' = seen in the lane's transcript; 'queued' = accepted, not yet seen. */
-  delivery: 'confirmed' | 'queued';
-  transport: 'codex_queue';
-  thread_id: string;
+  /**
+   * 'confirmed' = seen in the lane's transcript; 'queued' = accepted, not yet seen;
+   * 'unacknowledged' = written to a Claude lane's bridge socket, surface ack never came.
+   */
+  delivery: 'confirmed' | 'queued' | 'unacknowledged';
+  transport: 'codex_queue' | 'claude_channel';
+  thread_id?: string;
+  session_id?: string;
   delivery_id: string;
   text_chars: number;
   queued_message_id?: string;

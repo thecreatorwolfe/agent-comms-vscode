@@ -1,4 +1,5 @@
 import { randomUUID } from 'node:crypto';
+import { readdir, readFile, stat } from 'node:fs/promises';
 import path from 'node:path';
 import * as vscode from 'vscode';
 import type { Logger } from 'pino';
@@ -22,6 +23,7 @@ import {
   deliverViaQueue,
 } from './codex/queue-delivery';
 import { relayTextToAgent } from './codex/agent-message';
+import { claudeHomeDir } from './claude/channel-delivery';
 import { SpawnedTerminalRegistry } from './registry/terminals';
 import { GatewayHttpServer } from './gateway/http';
 import { WsGateway } from './gateway/ws';
@@ -1574,11 +1576,30 @@ export async function bootstrap(
           cliPath: vscode.workspace.getConfiguration('agentComms').get<string>('codexCliPath') || 'codex',
           defaultSender: 'Nick, relayed by Soph',
           newDeliveryId: () => randomUUID().slice(0, 8),
+          newEventId: () => randomUUID(),
+          // Claude lanes: one event frame down the lane's own bridge socket (the
+          // route Slack pings take), confirmed against the session transcript.
+          claude: {
+            pushEvent: (frame) => wsGateway.sendEvent(frame),
+            waitForAck: (deliveryId, timeoutMs) => wsGateway.waitForEventAck(deliveryId, timeoutMs),
+            ancestorPids: codexQueueDeps.ancestorPids,
+            readText: async (filePath) => {
+              try { return await readFile(filePath, 'utf8'); } catch { return null; }
+            },
+            listDir: (dirPath) => readdir(dirPath),
+            mtimeMs: async (filePath) => {
+              try { return (await stat(filePath)).mtimeMs; } catch { return null; }
+            },
+            claudeHome: claudeHomeDir(),
+            now: () => Date.now(),
+            sleep: (ms) => new Promise((resolve) => setTimeout(resolve, ms)),
+          },
         },
       );
       outputChannel.appendLine(
         `[agent-comms] relayed ${result.text_chars} chars to ${result.persona} `
-        + `(thread ${result.thread_id}, ${result.delivery}, lane was ${result.activity})`,
+        + `(${result.transport} ${result.thread_id ?? result.session_id ?? 'session unidentified'}, `
+        + `${result.delivery}, lane was ${result.activity})`,
       );
       return result;
     },

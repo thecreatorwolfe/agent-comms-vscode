@@ -135,7 +135,7 @@ describe('relaying free-form text to a running lane', () => {
     expect(runCodexQueue).not.toHaveBeenCalled();
   });
 
-  it('refuses a lane that is not Codex without touching the CLI', async () => {
+  it('refuses a non-Codex lane when no bridge path is wired, without touching the CLI', async () => {
     const { call, runCodexQueue } = harness({ agent: { ...AGENT, kind: 'claude' } });
     await expect(call('hello')).rejects.toBeInstanceOf(UnsupportedRuntimeError);
     expect(runCodexQueue).not.toHaveBeenCalled();

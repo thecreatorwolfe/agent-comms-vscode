@@ -32,6 +32,22 @@ User-level config points Claude and Codex at stable launcher scripts under `~/.a
 5. Claude or Codex bridge processes forward the event into their local session.
 6. Outbound protocol-formatted messages return through `/outbound-oneshot` or WS `outbound`.
 
+## Telling a running lane something (`POST /agent-message`)
+
+Free-form text from Soph's `tell_lane`, delivered without restarting the lane. `src/codex/agent-message.ts` picks the
+transport by runtime:
+
+- **Codex** — `codex queue --thread <id>` (below), confirmed in the rollout transcript.
+- **Claude** — `src/claude/channel-delivery.ts` writes one `event` frame to the lane's bridge socket. The bridge
+  surfaces it as a `notifications/claude/channel` message and acks; Claude Code queues it. The gateway confirms by
+  finding the `[relay <id>]` marker in the session transcript under `~/.claude/projects/` (session from the bridge's
+  parent `~/.claude/sessions/<pid>.json`, else the one record named for the persona, else the one fresh transcript in
+  the lane's project folder). Claude Code's own peer socket (`/tmp/cc-socks`) is deliberately not used: it is an
+  internal, per-version protocol keyed by per-session files.
+
+Nothing is retried on either path; an uncertain result is reported as such, because a second copy would arrive
+alongside the first.
+
 ## Waking a Codex session
 
 A bridge event reaches the Codex MCP subprocess, but a session that is mid-task or parked at its prompt also needs a nudge that it will actually act on. `src/codex/queue-delivery.ts` does that without touching the terminal:

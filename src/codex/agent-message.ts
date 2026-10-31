@@ -26,6 +26,7 @@ import {
   type CodexThreadIndex,
   type QueueDeliveryDeps,
 } from './queue-delivery';
+import { deliverViaClaudeChannel, type ClaudeChannelDeps } from '../claude/channel-delivery';
 
 export class AgentNotFoundError extends Error {
   override name = 'AgentNotFoundError';
@@ -58,9 +59,12 @@ export interface RelayTextResult {
   persona: string;
   kind: string;
   activity: string;
-  delivery: 'confirmed' | 'queued';
-  transport: 'codex_queue';
-  thread_id: string;
+  delivery: 'confirmed' | 'queued' | 'unacknowledged';
+  transport: 'codex_queue' | 'claude_channel';
+  /** Codex lanes: the thread the queue wrote to. */
+  thread_id?: string;
+  /** Claude lanes: the session whose transcript confirmed it, when it could be identified. */
+  session_id?: string;
   delivery_id: string;
   /** Length of the caller's text, so a relay can be reported without echoing it. */
   text_chars: number;
@@ -79,6 +83,10 @@ export interface RelayTextDeps {
   cliPath: string;
   defaultSender: string;
   newDeliveryId(): string;
+  /** Claude lanes: the bridge socket and the files that confirm a delivery. Absent = Claude lanes refused. */
+  claude?: ClaudeChannelDeps;
+  /** A full UUID; the bridge's event frame requires one. */
+  newEventId?(): string;
 }
 
 // Measured 2026-09-21 against codex-cli 0.155.1, from four session rollouts:
@@ -120,10 +128,13 @@ export async function relayTextToAgent(
     );
   }
 
+  if (agent.kind === 'claude' && deps.claude && deps.newEventId) {
+    return relayToClaudeLane(agent, input, deps as RelayTextDeps & Required<Pick<RelayTextDeps, 'claude' | 'newEventId'>>);
+  }
+
   if (agent.kind !== 'codex') {
     throw new UnsupportedRuntimeError(
-      `${agent.persona} is a ${agent.kind} lane. This route delivers over the Codex CLI message queue; `
-      + `${agent.kind} lanes receive messages over their bridge socket.`,
+      `${agent.persona} is a ${agent.kind} lane, and this gateway has no delivery path for that runtime. Nothing sent.`,
     );
   }
 
@@ -195,4 +206,71 @@ export async function relayTextToAgent(
     ...(outcome.queuedMessageId ? { queued_message_id: outcome.queuedMessageId } : {}),
     note: QUEUED_NOTE,
   };
+}
+
+// Measured 2026-10-31 on Claude Code 2.1.316: the channel message is written
+// to the transcript as a queue `enqueue` within ~0.5s, whether or not a turn
+// is running. A busy lane's in-flight tool call finishes untouched (a 45s
+// command ran to completion) and the queued message is handed over with that
+// tool result ("A message arrived ... while you were working"); an idle lane
+// takes it as its next prompt at once.
+const CLAUDE_CONFIRMED_NOTE =
+  'The lane\'s session has this text: it is in the session transcript. An idle lane reads it now; a lane mid-turn '
+  + 'reads it at its next step, without its current work being interrupted. Taken is not read and read is not '
+  + 'done — ask the lane, or watch what it does, before reporting that it complied.';
+
+const CLAUDE_QUEUED_NOTE =
+  'Claude Code accepted this text from the lane\'s bridge, and it is not in the transcript yet. That is the ordinary '
+  + 'answer for a lane with a turn in flight: queued input is taken when the session reaches it. Do not resend — a '
+  + 'second copy would arrive alongside the first. Check the lane again shortly.';
+
+const CLAUDE_UNACKNOWLEDGED_NOTE =
+  'The text was written to the lane\'s bridge socket, but the bridge did not confirm handing it to Claude Code. It '
+  + 'may well have arrived. Do not resend — check the lane first, because a second copy would arrive alongside the first.';
+
+async function relayToClaudeLane(
+  agent: RelayTargetAgent,
+  input: RelayTextInput,
+  deps: RelayTextDeps & Required<Pick<RelayTextDeps, 'claude' | 'newEventId'>>,
+): Promise<RelayTextResult> {
+  const sender = input.sender?.trim() || deps.defaultSender;
+  const envelope = buildRelayEnvelope({ sender, text: input.text, deliveryId: deps.newDeliveryId() });
+
+  const outcome = await deliverViaClaudeChannel(
+    {
+      persona: agent.persona,
+      pid: agent.pid,
+      cwd: agent.cwd,
+      sender,
+      eventId: deps.newEventId(),
+      marker: envelope.marker,
+      message: envelope.message,
+      ...(typeof input.confirmTimeoutMs === 'number' ? { confirmTimeoutMs: input.confirmTimeoutMs } : {}),
+    },
+    deps.claude,
+  );
+
+  if (outcome.stage === 'socket' || outcome.stage === 'surface') {
+    throw new AgentUnreachableError(`Nothing reached ${agent.persona}: ${outcome.reason}.`);
+  }
+
+  const session = 'session' in outcome ? outcome.session : undefined;
+  const base = {
+    persona: agent.persona,
+    kind: agent.kind,
+    activity: agent.activity,
+    transport: 'claude_channel' as const,
+    ...(session ? { session_id: session.sessionId } : {}),
+    delivery_id: envelope.deliveryId,
+    text_chars: input.text.length,
+    execution_verified: false as const,
+  };
+
+  if (outcome.stage === 'confirmed') {
+    return { ...base, delivery: 'confirmed', confirmed_in_ms: outcome.confirmedInMs, note: CLAUDE_CONFIRMED_NOTE };
+  }
+  if (outcome.stage === 'unacknowledged') {
+    return { ...base, delivery: 'unacknowledged', note: CLAUDE_UNACKNOWLEDGED_NOTE };
+  }
+  return { ...base, delivery: 'queued', note: CLAUDE_QUEUED_NOTE };
 }
