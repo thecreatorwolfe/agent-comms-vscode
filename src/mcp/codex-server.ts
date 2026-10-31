@@ -2,7 +2,6 @@ import { randomUUID } from 'node:crypto';
 import { cwd } from 'node:process';
 import { z } from 'zod';
 import { McpServer } from '@modelcontextprotocol/sdk/server/mcp.js';
-import { StdioServerTransport } from '@modelcontextprotocol/sdk/server/stdio.js';
 import type { AgentCommsLogLevel } from '../env';
 import { createLogger } from '../log';
 import {
@@ -18,6 +17,7 @@ import {
 import { fetchSelfAgentStatus, formatAgentConnectionSnapshot, formatAgentStatus } from './status';
 import { resolveBridgeEnv, resolveBridgeProfileId } from './runtime-env';
 import { AgentCommsWsClient } from './ws-client';
+import { connectStdioBridge } from './bridge-lifecycle';
 import { refineSpawnEffort, refineSpawnModel, SPAWN_MODEL_PARAM_DESCRIPTION , SPAWN_EFFORT_PARAM_DESCRIPTION } from '../spawn-model';
 
 function buildEventLogMessage(frame: {
@@ -423,22 +423,7 @@ async function main(): Promise<void> {
     },
   );
 
-  const transport = new StdioServerTransport();
-  await server.connect(transport);
-  await client.start();
-
-  const shutdown = async () => {
-    await client.stop();
-    await server.close();
-    process.exit(0);
-  };
-
-  process.on('SIGINT', () => {
-    void shutdown();
-  });
-  process.on('SIGTERM', () => {
-    void shutdown();
-  });
+  await connectStdioBridge(server, client, logger);
 }
 
 void main().catch((error) => {

@@ -19,6 +19,8 @@ Two subprocesses connect back to the hub:
 
 Both maintain a localhost WebSocket connection, authenticate with `ROUTER_SHARED_SECRET`, and receive routed Slack events from the extension.
 
+`src/mcp/bridge-lifecycle.ts` ties each bridge's lifetime to its MCP input. Input EOF/closure, MCP server closure, and termination signals stop heartbeats and reconnects, send a hub close frame when authenticated, and exit the bridge. Socket closure has a one-second fallback; shutdown has a two-second exit deadline once the lifecycle handler runs. Codex profile resolution occurs before that handler is installed and has separate process-query timeouts. A hub disconnect alone keeps the bridge alive and reconnecting, with the existing registry disconnect grace. Installing a new extension does not replace bridge processes already running.
+
 User-level config points Claude and Codex at stable launcher scripts under `~/.agent-comms/bin/`. Those launchers are rewritten to the current extension install path whenever Agent Comms starts or installs global bridges, so the config does not have to change on every extension update. Manual Claude resume flows can use the dedicated stable wrapper `~/.agent-comms/bin/claude-agent-comms-resume`.
 
 ## Message flow

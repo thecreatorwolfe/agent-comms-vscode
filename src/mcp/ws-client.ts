@@ -103,6 +103,7 @@ export class AgentCommsWsClient {
     }
     | undefined;
   private stopped = false;
+  private stopPromise: Promise<void> | undefined;
   private authenticated = false;
   private persona: string | undefined;
   private lastConnectionError: string | undefined;
@@ -119,11 +120,16 @@ export class AgentCommsWsClient {
   }
 
   async start(): Promise<void> {
-    this.stopped = false;
+    if (this.stopped) {
+      return;
+    }
     this.connect();
   }
 
   async stop(reason = 'client_shutdown'): Promise<void> {
+    if (this.stopPromise) {
+      return this.stopPromise;
+    }
     this.stopped = true;
     this.connectionState = 'stopped';
     this.stopHeartbeat();
@@ -132,15 +138,47 @@ export class AgentCommsWsClient {
       this.reconnectTimer = undefined;
     }
 
-    if (this.authenticated && this.ws?.readyState === WebSocket.OPEN && this.persona) {
-      this.sendJson({
-        type: 'close',
-        persona: this.persona,
-        reason,
-      });
+    this.rejectPendingOutbound(new Error('Agent Comms client stopped'));
+    this.rejectPendingStateTransitions(new Error('Agent Comms client stopped'));
+    this.stopPromise = this.closeSocket(reason);
+    this.authenticated = false;
+    return this.stopPromise;
+  }
+
+  private async closeSocket(reason: string): Promise<void> {
+    const socket = this.ws;
+    if (!socket || socket.readyState === WebSocket.CLOSED) {
+      return;
     }
 
-    this.ws?.close(1000, reason);
+    await new Promise<void>((resolve) => {
+      const finish = () => {
+        clearTimeout(deadline);
+        socket.off('close', finish);
+        resolve();
+      };
+      const deadline = setTimeout(() => {
+        this.options.logger?.warn('Hub socket close timed out; terminating it.');
+        socket.terminate();
+        finish();
+      }, 1_000);
+      socket.once('close', finish);
+
+      try {
+        if (this.authenticated && socket.readyState === WebSocket.OPEN && this.persona) {
+          this.sendJson({ type: 'close', persona: this.persona, reason });
+        }
+        if (socket.readyState === WebSocket.CONNECTING) {
+          socket.terminate();
+        } else {
+          socket.close(1000, reason);
+        }
+      } catch (error) {
+        this.options.logger?.warn({ err: error }, 'Hub socket close failed; terminating it.');
+        socket.terminate();
+        finish();
+      }
+    });
   }
 
   getCurrentPersona(): string | undefined {
@@ -319,6 +357,9 @@ export class AgentCommsWsClient {
   async waitForAuth(timeoutMs = 15_000): Promise<string> {
     const deadline = Date.now() + timeoutMs;
     while (Date.now() < deadline) {
+      if (this.stopped) {
+        throw new Error('Agent Comms client stopped');
+      }
       if (this.authenticated && this.persona) {
         return this.persona;
       }
@@ -335,6 +376,9 @@ export class AgentCommsWsClient {
     this.ws = new WebSocket(`ws://127.0.0.1:${this.options.port}/ws`);
 
     this.ws.on('open', () => {
+      if (this.stopped) {
+        return;
+      }
       this.sendJson({
         type: 'auth',
         secret: this.options.secret,
@@ -380,6 +424,9 @@ export class AgentCommsWsClient {
   }
 
   private async handleIncoming(raw: string): Promise<void> {
+    if (this.stopped) {
+      return;
+    }
     let parsed: unknown;
     try {
       parsed = JSON.parse(raw);
