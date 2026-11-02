@@ -1,5 +1,15 @@
 # Changelog
 
+## 0.2.64
+
+- **Spawn model allowlist follows the account.** `claude-opus-5-5`, `claude-sonnet-5-5` and `claude-haiku-5-5` join
+  the built-in list (verified 2026-11-02 against `GET /v1/models`). Beyond the built-in list, any Claude id listed in
+  `~/.agent-comms/spawn-models.json` (`{ "claude": [...] }`; path override `AGENT_COMMS_SPAWN_MODELS_FILE`) is
+  accepted by `/spawn`, `agent_comms_spawn` and the Codex bridge. The alfred-hub model-release watch writes that file
+  from the Anthropic Models API every 6 h, so a model shipped after this build is spawnable with no rebuild. The file
+  is re-read when its mtime changes; a missing or malformed file adds nothing; only `claude-` ids of
+  command-line-safe characters are taken.
+
 ## 0.2.63
 
 - `POST /agent-message` now reaches Claude lanes too. A Claude lane gets one `event` frame down its own bridge
