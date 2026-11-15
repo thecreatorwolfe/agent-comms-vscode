@@ -278,7 +278,7 @@ describe('deliverViaQueue', () => {
 
     const outcome = await deliverViaQueue(base, deps);
 
-    expect(outcome).toEqual({ ok: false, reason: 'codex queue exit 1: no such thread' });
+    expect(outcome).toEqual({ ok: false, stage: 'queue', reason: 'codex queue exit 1: no such thread' });
   });
 
   it('reports failure when the CLI claims success but nothing lands', async () => {

@@ -136,7 +136,11 @@ export interface DeliverInput {
 
 export type DeliveryOutcome =
   | { ok: true; queuedMessageId?: string; confirmedInMs: number }
-  | { ok: false; reason: string; queuedMessageId?: string };
+  // `stage` says which half failed. 'queue' means the CLI would not take the
+  // message, so nothing is pending. 'confirm' means the CLI took it and the
+  // transcript had not shown it yet, which is the ordinary reading for a lane
+  // that is mid-turn. Callers must not tell those apart by parsing `reason`.
+  | { ok: false; stage: 'queue' | 'confirm'; reason: string; queuedMessageId?: string };
 
 const DEFAULT_TOLERANCE_MS = 120_000;
 const DEFAULT_CONFIRM_TIMEOUT_MS = 8_000;
@@ -297,12 +301,12 @@ export async function deliverViaQueue(
     });
   } catch (error) {
     const detail = error instanceof Error ? error.message : String(error);
-    return { ok: false, reason: `codex queue failed to run: ${detail}` };
+    return { ok: false, stage: 'queue', reason: `codex queue failed to run: ${detail}` };
   }
 
   if (run.code !== 0) {
     const detail = (run.stderr || run.stdout || '').trim().split('\n')[0] ?? '';
-    return { ok: false, reason: `codex queue exit ${run.code}${detail ? `: ${detail}` : ''}` };
+    return { ok: false, stage: 'queue', reason: `codex queue exit ${run.code}${detail ? `: ${detail}` : ''}` };
   }
 
   const queuedMessageId = parseQueuedMessageId(run.stdout);
@@ -325,6 +329,7 @@ export async function deliverViaQueue(
     if (deps.now() >= deadline) {
       return {
         ok: false,
+        stage: 'confirm',
         reason: `queued but unconfirmed after ${timeout}ms; session may not be running`,
         queuedMessageId,
       };
@@ -506,5 +511,63 @@ export function createQueueDeliveryDeps(): QueueDeliveryDeps {
     runCodexQueue: runCodexQueueOnDisk,
     now: () => Date.now(),
     sleep: (ms) => new Promise((resolve) => setTimeout(resolve, ms)),
+  };
+}
+
+// ---------------------------------------------------------------------------
+// Free-form relay: Soph telling a running lane something, in her own words.
+//
+// The ping path above carries one fixed sentence ("go read Slack"). This
+// carries whatever Nick actually said. Same channel, same confirmation, no new
+// injection route — `codex queue` hands the text to the session itself, so a
+// busy lane consumes it at its next turn boundary instead of having it typed
+// into the middle of a turn.
+//
+// The text never touches a shell: runCodexQueue uses execFile with an argv
+// array, so quotes, newlines and backticks are ordinary characters.
+// ---------------------------------------------------------------------------
+
+/**
+ * Upper bound on relayed text. macOS ARG_MAX is about 1MB and the message
+ * rides in argv, so this is far below the limit; it exists to keep a runaway
+ * caller from pushing a whole file into a lane's context.
+ */
+export const RELAY_TEXT_MAX_CHARS = 32_000;
+
+export interface RelayEnvelope {
+  /** What the lane actually receives. */
+  message: string;
+  /** The substring that identifies this delivery in the lane's transcript. */
+  marker: string;
+  deliveryId: string;
+}
+
+export function validateRelayText(text: unknown): text is string {
+  return typeof text === 'string'
+    && text.trim().length > 0
+    && text.length <= RELAY_TEXT_MAX_CHARS
+    // execFile rejects a NUL in argv; catch it here so the caller gets a reason
+    // rather than a spawn error.
+    && !text.includes('\u0000');
+}
+
+/**
+ * Wraps the text so the lane knows who is talking and so the delivery can be
+ * found again in the transcript.
+ *
+ * The marker is a generated id rather than a slice of the text: two identical
+ * messages to the same lane must not confirm each other, and text chosen by a
+ * speaker cannot be assumed unique.
+ */
+export function buildRelayEnvelope(input: {
+  sender: string;
+  text: string;
+  deliveryId: string;
+}): RelayEnvelope {
+  const marker = `[relay ${input.deliveryId}]`;
+  return {
+    marker,
+    deliveryId: input.deliveryId,
+    message: `Message from ${input.sender} ${marker}:\n\n${input.text}`,
   };
 }

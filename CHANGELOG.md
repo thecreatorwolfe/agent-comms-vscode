@@ -1,5 +1,16 @@
 # Changelog
 
+## 0.2.62
+
+- **Corrected when a queued message actually lands.** Four session rollouts show a queued message entering the transcript at the TURN BOUNDARY, not on arrival; the earlier comment claimed an immediate write and was wrong. A confirmation means the lane has taken the text, and how long that takes is set by the turn in flight. A lane mid-way through a long turn now honestly reports `queued` rather than the window being shortened to make confirmations look faster.
+- **A queue delivery the CLI accepted is no longer also typed into the terminal.** The Slack-ping path fell back to keystroke injection on both failure kinds; on `stage: 'confirm'` the message is already pending in the session, so injecting it delivered a second copy. Only a CLI-level refusal falls back now.
+- **A lane inside its disconnect grace window can no longer be addressed.** `registry.get()` still returns it; `registry.list()` does not. Relay lookups use the latter, so a lane that has gone is a refusal rather than a queue write nobody reads.
+- **One validator, not two copies.** The `/agent-message` route now calls `validateRelayText` instead of restating the same three rules inline.
+
+## 0.2.61
+
+- **Free-form text can now be delivered into a running Codex lane.** New `POST /agent-message` hands arbitrary text to a named lane through the CLI's own queue (`codex queue --thread <id> --message <text>`), reusing the thread resolution and transcript confirmation the Slack-ping path already uses — no second injection path and no terminal keystrokes. A lane that is mid-turn finishes that turn untouched and takes the message next; an idle lane takes it immediately. The receipt distinguishes three facts that used to be conflated: the CLI accepted it, the transcript holds it, and the agent acted on it — only the first two are ever reported, and `execution_verified` is always false. Unknown persona, non-Codex lane, and unresolvable session are refusals that send nothing rather than guesses. Closes the gap where telling a lane something meant killing and respawning it.
+
 ## 0.2.60
 
 - **Security: settings that name an executable or a secret file are now machine scope.** `agentComms.codexCliPath` is passed to `execFile`, and `agentComms.envFilePath` points at the file holding the router secret. Both defaulted to window scope, so any repository's `.vscode/settings.json` could set them and opening an untrusted repo was enough to run a chosen binary. Found by the pre-push security review.
