@@ -1,4 +1,5 @@
 import crypto from 'node:crypto';
+import { execFile } from 'node:child_process';
 import fs from 'node:fs';
 import os from 'node:os';
 import path from 'node:path';
@@ -6,16 +7,106 @@ import { parse as parseDotenv } from 'dotenv';
 import type { AgentCommsLogLevel } from '../env';
 
 /**
- * Deterministic RFC-4122 v5-style UUID derived from the session working
- * directory. Used as a stable profile id when no explicit
- * AGENT_COMMS_PROFILE_ID is provided (i.e. a manually-launched agent, not a
- * hub spawn). Because it is stable across bridge AND hub restarts, the hub can
- * persist and auto-reclaim the persona keyed by session dir. Spawned agents
- * always receive an explicit AGENT_COMMS_PROFILE_ID and never hit this path,
- * so there is no collision with spawn-managed ids. (B8)
+ * The agent process a bridge belongs to, identified by pid and start time.
+ *
+ * Start time matters because pids are reused. Together they stay constant for
+ * the life of one session, including across bridge and hub restarts, which is
+ * what profile persistence needs.
  */
-export function deriveStableProfileId(cwd: string): string {
-  const hex = crypto.createHash('sha1').update(`agent-comms-profile:${cwd}`).digest('hex').slice(0, 32).split('');
+export interface SessionAnchor {
+  pid: number;
+  startedAt: string;
+}
+
+const AGENT_COMMAND_NAMES = new Set(['codex', 'claude']);
+const ANCHOR_PS_TIMEOUT_MS = 4_000;
+const ANCHOR_MAX_HOPS = 8;
+
+/**
+ * Finds the `codex` or `claude` process that owns this bridge.
+ *
+ * Never asks `ps` for the tty column: on some machines that listing takes
+ * minutes to return, which would stall every bridge at startup.
+ */
+export async function resolveSessionAnchor(
+  startPid: number = process.pid,
+  runPs: (args: string[]) => Promise<string> = defaultRunPs,
+): Promise<SessionAnchor | null> {
+  let table = '';
+  try {
+    table = await runPs(['-Ao', 'pid=,ppid=,comm=']);
+  } catch {
+    return null;
+  }
+
+  const parents = new Map<number, number>();
+  const commands = new Map<number, string>();
+  for (const rawLine of table.split(/\r?\n/)) {
+    const line = rawLine.trim();
+    if (!line) {
+      continue;
+    }
+
+    const match = /^(\d+)\s+(\d+)\s+(.+)$/.exec(line);
+    if (!match) {
+      continue;
+    }
+
+    const pid = Number(match[1]);
+    const parentPid = Number(match[2]);
+    if (!Number.isInteger(pid) || pid <= 0) {
+      continue;
+    }
+
+    if (Number.isInteger(parentPid) && parentPid > 0) {
+      parents.set(pid, parentPid);
+    }
+
+    commands.set(pid, match[3].trim().split('/').pop() ?? '');
+  }
+
+  const seen = new Set<number>();
+  let current = startPid;
+  for (let hop = 0; hop < ANCHOR_MAX_HOPS && Number.isInteger(current) && current > 1 && !seen.has(current); hop += 1) {
+    seen.add(current);
+    const command = commands.get(current);
+    if (command && AGENT_COMMAND_NAMES.has(command)) {
+      let startedAt = '';
+      try {
+        startedAt = (await runPs(['-p', String(current), '-o', 'lstart='])).trim();
+      } catch {
+        startedAt = '';
+      }
+
+      return { pid: current, startedAt };
+    }
+
+    const parent = parents.get(current);
+    if (!parent || parent === current) {
+      break;
+    }
+
+    current = parent;
+  }
+
+  return null;
+}
+
+function defaultRunPs(args: string[]): Promise<string> {
+  return new Promise((resolve, reject) => {
+    execFile('ps', args, { encoding: 'utf8', maxBuffer: 4 * 1024 * 1024, timeout: ANCHOR_PS_TIMEOUT_MS }, (error, stdout) => {
+      if (error) {
+        reject(error);
+        return;
+      }
+
+      resolve(stdout ?? '');
+    });
+  });
+}
+
+function hashToUuid(input: string): string {
+  const hex = crypto.createHash('sha1').update(input).digest('hex').slice(0, 32).split('');
   hex[12] = '5';
   hex[16] = ((parseInt(hex[16], 16) & 0x3) | 0x8).toString(16);
   const joined = hex.join('');
@@ -26,6 +117,32 @@ export function deriveStableProfileId(cwd: string): string {
     joined.slice(16, 20),
     joined.slice(20, 32),
   ].join('-');
+}
+
+/**
+ * Profile id for a manually-launched session.
+ *
+ * Keyed on the owning agent process as well as the directory, because several
+ * agents routinely run in one repository. Keying on the directory alone gave
+ * them all the same id, so they fought over a single saved persona and the
+ * losers were left unreachable after a hub restart.
+ */
+export function deriveSessionProfileId(cwd: string, anchor: SessionAnchor | null): string {
+  if (!anchor) {
+    return deriveStableProfileId(cwd);
+  }
+
+  return hashToUuid(`agent-comms-profile:${cwd}:${anchor.pid}:${anchor.startedAt}`);
+}
+
+/**
+ * Directory-only profile id. Kept as the last resort for a session whose owning
+ * process cannot be identified, and as the shape the hub has always persisted.
+ * It is NOT unique when several agents share a directory, which is why
+ * `deriveSessionProfileId` is preferred.
+ */
+export function deriveStableProfileId(cwd: string): string {
+  return hashToUuid(`agent-comms-profile:${cwd}`);
 }
 
 export interface AgentCommsBridgeEnv {
@@ -117,4 +234,23 @@ export function resolveBridgeEnv(
     pid,
     logLevel,
   };
+}
+
+/**
+ * The profile id a bridge should present at auth.
+ *
+ * A hub spawn supplies its own unique id and always wins. A manual session
+ * derives one from its owning agent process so that two sessions in one
+ * directory no longer collide.
+ */
+export async function resolveBridgeProfileId(
+  env: NodeJS.ProcessEnv = process.env,
+  cwd: string = process.cwd(),
+): Promise<string> {
+  const explicit = firstDefined(env.AGENT_COMMS_PROFILE_ID);
+  if (explicit) {
+    return explicit;
+  }
+
+  return deriveSessionProfileId(cwd, await resolveSessionAnchor());
 }

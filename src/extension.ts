@@ -1,4 +1,5 @@
 import * as vscode from 'vscode';
+import { startSlashTerminalBridge } from './slash-terminal';
 import { installGlobalBridgeConfig } from './global';
 import { bootstrap, type AgentCommsRuntime } from './main';
 import { PROJECT_OVERRIDE_KEY } from './persona/project';
@@ -166,6 +167,9 @@ async function attemptAutoStart(context: vscode.ExtensionContext, reason: string
 
 export async function activate(context: vscode.ExtensionContext): Promise<void> {
   context.subscriptions.push(getOutputChannel());
+  try {
+    context.subscriptions.push(await startSlashTerminalBridge(appendOutput));
+  } catch (error) { appendOutput(`terminal slash-command bridge unavailable: ${getErrorMessage(error)}`); }
   context.subscriptions.push(
     vscode.commands.registerCommand('agentComms.start', async () => {
       await withCommandErrors(async () => {

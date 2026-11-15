@@ -19,6 +19,8 @@ Two subprocesses connect back to the hub:
 
 Both maintain a localhost WebSocket connection, authenticate with `ROUTER_SHARED_SECRET`, and receive routed Slack events from the extension.
 
+`src/mcp/bridge-lifecycle.ts` ties each bridge's lifetime to its MCP input. Input EOF/closure, MCP server closure, and termination signals stop heartbeats and reconnects, send a hub close frame when authenticated, and exit the bridge. Socket closure has a one-second fallback; shutdown has a two-second exit deadline once the lifecycle handler runs. Codex profile resolution occurs before that handler is installed and has separate process-query timeouts. A hub disconnect alone keeps the bridge alive and reconnecting, with the existing registry disconnect grace. Installing a new extension does not replace bridge processes already running.
+
 User-level config points Claude and Codex at stable launcher scripts under `~/.agent-comms/bin/`. Those launchers are rewritten to the current extension install path whenever Agent Comms starts or installs global bridges, so the config does not have to change on every extension update. Manual Claude resume flows can use the dedicated stable wrapper `~/.agent-comms/bin/claude-agent-comms-resume`.
 
 ## Message flow
@@ -29,6 +31,31 @@ User-level config points Claude and Codex at stable launcher scripts under `~/.a
 4. `src/gateway/ws.ts` emits one `event` frame per matching live agent.
 5. Claude or Codex bridge processes forward the event into their local session.
 6. Outbound protocol-formatted messages return through `/outbound-oneshot` or WS `outbound`.
+
+## Telling a running lane something (`POST /agent-message`)
+
+Free-form text from Soph's `tell_lane`, delivered without restarting the lane. `src/codex/agent-message.ts` picks the
+transport by runtime:
+
+- **Codex** — `codex queue --thread <id>` (below), confirmed in the rollout transcript.
+- **Claude** — `src/claude/channel-delivery.ts` writes one `event` frame to the lane's bridge socket. The bridge
+  surfaces it as a `notifications/claude/channel` message and acks; Claude Code queues it. The gateway confirms by
+  finding the `[relay <id>]` marker in the session transcript under `~/.claude/projects/` (session from the bridge's
+  parent `~/.claude/sessions/<pid>.json`, else the one record named for the persona, else the one fresh transcript in
+  the lane's project folder). Claude Code's own peer socket (`/tmp/cc-socks`) is deliberately not used: it is an
+  internal, per-version protocol keyed by per-session files.
+
+Nothing is retried on either path; an uncertain result is reported as such, because a second copy would arrive
+alongside the first.
+
+## Waking a Codex session
+
+A bridge event reaches the Codex MCP subprocess, but a session that is mid-task or parked at its prompt also needs a nudge that it will actually act on. `src/codex/queue-delivery.ts` does that without touching the terminal:
+
+1. The persona's thread is resolved from `~/.codex/sessions` by matching the agent's working directory and registration time, then cached until the agent reconnects.
+2. The ping is handed over with `codex queue --thread <id> --message <text>`.
+3. The session transcript is polled until the ping appears, which is what proves delivery. The CLI reports success even when no session is listening, so its exit code alone is not trusted.
+4. If the thread cannot be resolved or the delivery cannot be confirmed, the hub falls back to writing the ping into the agent's terminal.
 
 ## State
 

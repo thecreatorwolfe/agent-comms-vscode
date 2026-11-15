@@ -10,11 +10,18 @@
 // unchanged (aside from trimming). This module has no `vscode` dependency so it
 // can be shared by the stand-alone MCP shims and the extension host.
 
+import fs from 'node:fs';
+import os from 'node:os';
+import path from 'node:path';
 import { z } from 'zod';
 
 export const SPAWN_MODEL_ALIASES = ['fable', 'opus', 'sonnet', 'haiku'] as const;
 
+// claude-*-5-5 verified 2026-11-02 against GET /v1/models on the account's key.
 export const SPAWN_MODEL_FULL_IDS = [
+  'claude-opus-5-5',
+  'claude-sonnet-5-5',
+  'claude-haiku-5-5',
   'claude-fable-5-1',
   'claude-fable-5',
   'claude-opus-5',
@@ -33,9 +40,48 @@ export const SPAWN_MODEL_VALUES: readonly string[] = [
   ...SPAWN_MODEL_FULL_IDS,
 ];
 
+// Claude models released after this build. The alfred-hub model-release watch
+// writes every Claude id the account's Anthropic Models API lists to this file
+// ({ "claude": ["claude-opus-5-5", ...] }); those ids are accepted alongside
+// the built-in list, so a newly shipped model is spawnable without a rebuild.
+// Re-read whenever the file's mtime changes; a missing or malformed file adds
+// nothing. Only `claude-` ids of command-line-safe characters are taken.
+export const SPAWN_MODELS_FILE_ENV = 'AGENT_COMMS_SPAWN_MODELS_FILE';
+const LEDGER_CLAUDE_ID = /^claude-[a-z0-9][a-z0-9.-]{0,78}$/;
+let ledgerCache: { file: string; mtimeMs: number; ids: string[] } | null = null;
+
+export function spawnModelsFile(env: NodeJS.ProcessEnv = process.env): string {
+  return env[SPAWN_MODELS_FILE_ENV] || path.join(os.homedir(), '.agent-comms', 'spawn-models.json');
+}
+
+export function ledgerClaudeModelIds(file: string = spawnModelsFile()): string[] {
+  try {
+    const { mtimeMs } = fs.statSync(file);
+    if (ledgerCache && ledgerCache.file === file && ledgerCache.mtimeMs === mtimeMs) {
+      return ledgerCache.ids;
+    }
+    const parsed: unknown = JSON.parse(fs.readFileSync(file, 'utf8'));
+    const list = parsed && typeof parsed === 'object' ? (parsed as { claude?: unknown }).claude : undefined;
+    const ids = Array.isArray(list)
+      ? list.filter((v): v is string => typeof v === 'string')
+        .map((v) => v.trim().toLowerCase())
+        .filter((v) => LEDGER_CLAUDE_ID.test(v))
+      : [];
+    ledgerCache = { file, mtimeMs, ids };
+    return ids;
+  } catch {
+    return [];
+  }
+}
+
+/** Built-in aliases and ids, then any the hub's model ledger adds. */
+export function spawnModelValues(): string[] {
+  return [...new Set([...SPAWN_MODEL_VALUES, ...ledgerClaudeModelIds()])];
+}
+
 export function isSupportedSpawnModel(model: string): boolean {
   const candidate = model.trim().toLowerCase();
-  return SPAWN_MODEL_VALUES.some((value) => value === candidate);
+  return spawnModelValues().some((value) => value === candidate);
 }
 
 // Validate a caller-supplied model and return the exact string handed to
@@ -51,10 +97,11 @@ export function normalizeSpawnModel(model: string, kind: 'claude' | 'codex' = 'c
     return raw;
   }
   const candidate = model.trim().toLowerCase();
-  const match = SPAWN_MODEL_VALUES.find((value) => value === candidate);
+  const accepted = spawnModelValues();
+  const match = accepted.find((value) => value === candidate);
   if (!match) {
     throw new Error(
-      `Unsupported model "${model}". Accepted values: ${SPAWN_MODEL_VALUES.join(', ')}.`,
+      `Unsupported model "${model}". Accepted values: ${accepted.join(', ')}.`,
     );
   }
   return match;
@@ -85,7 +132,7 @@ export function refineSpawnModel(
     ctx.addIssue({
       code: z.ZodIssueCode.custom,
       path: ['model'],
-      message: `Unsupported model "${value.model}". Accepted values: ${SPAWN_MODEL_VALUES.join(', ')}.`,
+      message: `Unsupported model "${value.model}". Accepted values: ${spawnModelValues().join(', ')}.`,
     });
   }
 }
@@ -93,7 +140,7 @@ export function refineSpawnModel(
 export const SPAWN_MODEL_PARAM_DESCRIPTION =
   'Optional model for the spawned session. '
   + `kind='claude': an alias (${SPAWN_MODEL_ALIASES.join(', ')}) or a full model id `
-  + `(${SPAWN_MODEL_FULL_IDS.join(', ')}). kind='codex': a model name passed to codex -m. `
+  + `(${SPAWN_MODEL_FULL_IDS.join(', ')}, or any Claude id listed in ~/.agent-comms/spawn-models.json). kind='codex': a model name passed to codex -m. `
   + 'Omit to use the CLI default.';
 
 // ── Reasoning effort (added 0.2.49) ─────────────────────────────────────────

@@ -9,6 +9,7 @@ import { taskIdSchema } from '../schema/slack_message';
 import { createHttpSecretMiddleware } from './auth';
 import type { SpawnRequest, SpawnResult } from '../spawn';
 import { refineSpawnEffort, refineSpawnModel } from '../spawn-model';
+import { RELAY_TEXT_MAX_CHARS, validateRelayText } from '../codex/queue-delivery';
 
 const slackThreadTsInputSchema = z.union([z.string().min(1), z.number().finite()]).transform((value) => String(value));
 
@@ -47,6 +48,46 @@ const renameRequestSchema = z.object({
   instance_number: z.number().int().min(1).nullable().optional(),
 });
 
+/**
+ * Free-form text for a running lane. `text` is carried to the agent's own CLI
+ * as one argv entry, so it may contain newlines, quotes and backticks; only a
+ * NUL is rejected, because argv cannot hold one.
+ */
+const agentMessageSchema = z.object({
+  persona: z.string().min(1),
+  // The rule lives in validateRelayText so the route and the delivery path
+  // cannot drift apart; zod only reports it.
+  text: z.string().refine(validateRelayText, {
+    message: `text must be non-blank, free of NUL, and at most ${RELAY_TEXT_MAX_CHARS} characters`,
+  }),
+  sender: z.string().min(1).max(120).nullable().optional(),
+  confirm_timeout_ms: z.number().int().min(500).max(60_000).nullable().optional(),
+});
+
+export type AgentMessageRequest = z.infer<typeof agentMessageSchema>;
+
+export interface AgentMessageResult {
+  persona: string;
+  kind: string;
+  /** What the lane was doing when the text was handed over. */
+  activity: string;
+  /**
+   * 'confirmed' = seen in the lane's transcript; 'queued' = accepted, not yet seen;
+   * 'unacknowledged' = written to a Claude lane's bridge socket, surface ack never came.
+   */
+  delivery: 'confirmed' | 'queued' | 'unacknowledged';
+  transport: 'codex_queue' | 'claude_channel';
+  thread_id?: string;
+  session_id?: string;
+  delivery_id: string;
+  text_chars: number;
+  queued_message_id?: string;
+  confirmed_in_ms?: number;
+  /** Always false. Delivered is not read, and read is not acted on. */
+  execution_verified: false;
+  note: string;
+}
+
 export interface GatewayHttpServerOptions {
   port: number;
   routerSharedSecret: string;
@@ -70,6 +111,7 @@ export interface GatewayHttpServerOptions {
     persona: string;
     previous_persona: string;
   }>;
+  onAgentMessage: (request: AgentMessageRequest) => Promise<AgentMessageResult>;
 }
 
 function normalizeRouteError(error: unknown): { status: number; body: unknown } {
@@ -89,6 +131,15 @@ function normalizeRouteError(error: unknown): { status: number; body: unknown } 
     }
     if (error.name === 'SpawnPreconditionError') {
       return { status: 412, body: { error: error.message } };
+    }
+    if (error.name === 'AgentNotFoundError') {
+      return { status: 404, body: { error: error.message } };
+    }
+    if (error.name === 'AgentUnreachableError') {
+      return { status: 409, body: { error: error.message } };
+    }
+    if (error.name === 'UnsupportedRuntimeError') {
+      return { status: 501, body: { error: error.message } };
     }
     if (/Persona collision/i.test(error.message)) {
       return { status: 409, body: { error: error.message } };
@@ -221,6 +272,22 @@ export class GatewayHttpServer {
           connected_at: new Date(agent.connectedAt).toISOString(),
         })),
       });
+    });
+
+    this.app.post('/agent-message', requireSecret, async (request, response) => {
+      const parsed = agentMessageSchema.safeParse(request.body);
+      if (!parsed.success) {
+        response.status(400).json({ error: parsed.error.message });
+        return;
+      }
+
+      try {
+        response.json(await this.options.onAgentMessage(parsed.data));
+      } catch (error) {
+        this.options.logger?.error({ err: error }, 'agent message request failed');
+        const normalized = normalizeRouteError(error);
+        response.status(normalized.status).json(normalized.body);
+      }
     });
 
     this.app.post('/slack-history', requireSecret, async (request, response) => {

@@ -67,6 +67,13 @@ export function formatOutboundErrorMessage(
   ].join('');
 }
 
+/**
+ * How many refusals to accept before giving up a claimed persona. One can be a
+ * race with a session still shutting down; a second means the name is genuinely
+ * someone else's.
+ */
+const PERSONA_CONFLICT_SURRENDER_ATTEMPTS = 2;
+
 export class AgentCommsWsClient {
   private readonly options: AgentCommsWsClientOptions;
   private ws: WebSocket | undefined;
@@ -96,12 +103,14 @@ export class AgentCommsWsClient {
     }
     | undefined;
   private stopped = false;
+  private stopPromise: Promise<void> | undefined;
   private authenticated = false;
   private persona: string | undefined;
   private lastConnectionError: string | undefined;
   private connectionState: AgentCommsWsConnectionSnapshot['state'] = 'connecting';
   private personaSource: AuthAckFrame['persona_source'] | undefined;
   private registrationRequired = false;
+  private personaConflicts = 0;
   private hasAuthenticatedOnce = false;
   private disconnectNoticeShown = false;
 
@@ -111,11 +120,16 @@ export class AgentCommsWsClient {
   }
 
   async start(): Promise<void> {
-    this.stopped = false;
+    if (this.stopped) {
+      return;
+    }
     this.connect();
   }
 
   async stop(reason = 'client_shutdown'): Promise<void> {
+    if (this.stopPromise) {
+      return this.stopPromise;
+    }
     this.stopped = true;
     this.connectionState = 'stopped';
     this.stopHeartbeat();
@@ -124,15 +138,47 @@ export class AgentCommsWsClient {
       this.reconnectTimer = undefined;
     }
 
-    if (this.authenticated && this.ws?.readyState === WebSocket.OPEN && this.persona) {
-      this.sendJson({
-        type: 'close',
-        persona: this.persona,
-        reason,
-      });
+    this.rejectPendingOutbound(new Error('Agent Comms client stopped'));
+    this.rejectPendingStateTransitions(new Error('Agent Comms client stopped'));
+    this.stopPromise = this.closeSocket(reason);
+    this.authenticated = false;
+    return this.stopPromise;
+  }
+
+  private async closeSocket(reason: string): Promise<void> {
+    const socket = this.ws;
+    if (!socket || socket.readyState === WebSocket.CLOSED) {
+      return;
     }
 
-    this.ws?.close(1000, reason);
+    await new Promise<void>((resolve) => {
+      const finish = () => {
+        clearTimeout(deadline);
+        socket.off('close', finish);
+        resolve();
+      };
+      const deadline = setTimeout(() => {
+        this.options.logger?.warn('Hub socket close timed out; terminating it.');
+        socket.terminate();
+        finish();
+      }, 1_000);
+      socket.once('close', finish);
+
+      try {
+        if (this.authenticated && socket.readyState === WebSocket.OPEN && this.persona) {
+          this.sendJson({ type: 'close', persona: this.persona, reason });
+        }
+        if (socket.readyState === WebSocket.CONNECTING) {
+          socket.terminate();
+        } else {
+          socket.close(1000, reason);
+        }
+      } catch (error) {
+        this.options.logger?.warn({ err: error }, 'Hub socket close failed; terminating it.');
+        socket.terminate();
+        finish();
+      }
+    });
   }
 
   getCurrentPersona(): string | undefined {
@@ -311,6 +357,9 @@ export class AgentCommsWsClient {
   async waitForAuth(timeoutMs = 15_000): Promise<string> {
     const deadline = Date.now() + timeoutMs;
     while (Date.now() < deadline) {
+      if (this.stopped) {
+        throw new Error('Agent Comms client stopped');
+      }
       if (this.authenticated && this.persona) {
         return this.persona;
       }
@@ -327,6 +376,9 @@ export class AgentCommsWsClient {
     this.ws = new WebSocket(`ws://127.0.0.1:${this.options.port}/ws`);
 
     this.ws.on('open', () => {
+      if (this.stopped) {
+        return;
+      }
       this.sendJson({
         type: 'auth',
         secret: this.options.secret,
@@ -372,6 +424,9 @@ export class AgentCommsWsClient {
   }
 
   private async handleIncoming(raw: string): Promise<void> {
+    if (this.stopped) {
+      return;
+    }
     let parsed: unknown;
     try {
       parsed = JSON.parse(raw);
@@ -393,6 +448,7 @@ export class AgentCommsWsClient {
         this.connectionState = 'connected';
         this.persona = frame.persona;
         this.personaSource = frame.persona_source;
+        this.personaConflicts = 0;
         this.registrationRequired = frame.registration_required;
         this.lastConnectionError = undefined;
         this.startHeartbeat();
@@ -428,6 +484,24 @@ export class AgentCommsWsClient {
         this.connectionState = 'reconnecting';
         this.options.logger?.warn({ frame }, 'extension returned an auth error frame');
         this.options.logger?.warn(`Hub auth failed: ${frame.reason}. Reconnecting.`);
+        if (frame.reason === 'persona_conflict') {
+          this.personaConflicts += 1;
+          // Another live session holds this name. Retrying with it can never
+          // succeed, and every tool call is blocked behind auth, so the session
+          // would stay dark and unable to rename itself. Give the name up and
+          // reconnect unnamed; the hub issues a temporary persona and asks for
+          // registration, which a rename can then complete.
+          if (this.personaConflicts >= PERSONA_CONFLICT_SURRENDER_ATTEMPTS && this.persona) {
+            this.options.logger?.warn(
+              `Persona ${this.persona} is held by another live session. Reconnecting without it; `
+              + 'register with agent_comms_rename to claim a name.',
+            );
+            this.persona = undefined;
+            this.personaSource = undefined;
+            this.registrationRequired = true;
+          }
+        }
+
         return;
       case 'profile.reset':
         this.persona = frame.persona;

@@ -1,5 +1,80 @@
 # Changelog
 
+## 0.2.64
+
+- **Spawn model allowlist follows the account.** `claude-opus-5-5`, `claude-sonnet-5-5` and `claude-haiku-5-5` join
+  the built-in list (verified 2026-11-02 against `GET /v1/models`). Beyond the built-in list, any Claude id listed in
+  `~/.agent-comms/spawn-models.json` (`{ "claude": [...] }`; path override `AGENT_COMMS_SPAWN_MODELS_FILE`) is
+  accepted by `/spawn`, `agent_comms_spawn` and the Codex bridge. The alfred-hub model-release watch writes that file
+  from the Anthropic Models API every 6 h, so a model shipped after this build is spawnable with no rebuild. The file
+  is re-read when its mtime changes; a missing or malformed file adds nothing; only `claude-` ids of
+  command-line-safe characters are taken.
+
+## 0.2.63
+
+- `POST /agent-message` now reaches Claude lanes too. A Claude lane gets one `event` frame down its own bridge
+  socket (the route Slack pings already take) and Claude Code queues it as channel input: a lane mid-turn finishes
+  its current step untouched and reads the message with the next tool result; an idle lane takes it at once.
+  The gateway waits for the bridge's surface ack, then confirms by finding the delivery marker in the session
+  transcript (session found from the bridge's process tree, else by launch name, else by the one fresh transcript
+  in the lane's project folder). Results: `confirmed`, `queued`, or `unacknowledged` (frame written, no ack);
+  never retried. Bridges already running from 0.2.62 work unchanged; no lane restart is needed.
+
+## 0.2.62
+
+- **Corrected when a queued message actually lands.** Four session rollouts show a queued message entering the transcript at the TURN BOUNDARY, not on arrival; the earlier comment claimed an immediate write and was wrong. A confirmation means the lane has taken the text, and how long that takes is set by the turn in flight. A lane mid-way through a long turn now honestly reports `queued` rather than the window being shortened to make confirmations look faster.
+- **A queue delivery the CLI accepted is no longer also typed into the terminal.** The Slack-ping path fell back to keystroke injection on both failure kinds; on `stage: 'confirm'` the message is already pending in the session, so injecting it delivered a second copy. Only a CLI-level refusal falls back now.
+- **A lane inside its disconnect grace window can no longer be addressed.** `registry.get()` still returns it; `registry.list()` does not. Relay lookups use the latter, so a lane that has gone is a refusal rather than a queue write nobody reads.
+- **One validator, not two copies.** The `/agent-message` route now calls `validateRelayText` instead of restating the same three rules inline.
+
+## 0.2.61
+
+- **Free-form text can now be delivered into a running Codex lane.** New `POST /agent-message` hands arbitrary text to a named lane through the CLI's own queue (`codex queue --thread <id> --message <text>`), reusing the thread resolution and transcript confirmation the Slack-ping path already uses — no second injection path and no terminal keystrokes. A lane that is mid-turn finishes that turn untouched and takes the message next; an idle lane takes it immediately. The receipt distinguishes three facts that used to be conflated: the CLI accepted it, the transcript holds it, and the agent acted on it — only the first two are ever reported, and `execution_verified` is always false. Unknown persona, non-Codex lane, and unresolvable session are refusals that send nothing rather than guesses. Closes the gap where telling a lane something meant killing and respawning it.
+
+## 0.2.60
+
+- **Security: settings that name an executable or a secret file are now machine scope.** `agentComms.codexCliPath` is passed to `execFile`, and `agentComms.envFilePath` points at the file holding the router secret. Both defaulted to window scope, so any repository's `.vscode/settings.json` could set them and opening an untrusted repo was enough to run a chosen binary. Found by the pre-push security review.
+
+## 0.2.59
+
+- **Agents in one repository no longer fight over a persona.** A manually launched session derived its identity from its working directory alone, so every session in the same repo derived the same id and competed for one saved persona. The losers were left unreachable after a hub restart. Identity is now derived from the agent process that owns the bridge, using its pid and start time, so it stays stable across bridge and hub restarts while differing between sessions. Measured on live processes: 8 attached bridges produced 6 distinct ids, the two collisions being pairs of bridges inside the same session, where sharing is correct. Previously all 8 shared one id.
+- **A bridge refused a persona now recovers instead of looping.** Every tool call sits behind auth, so a session retrying a name another session holds stayed dark and could not even rename itself. After a second refusal it gives the name up, connects under a temporary persona, and asks for registration.
+- Neither lookup asks `ps` for the tty column, which on some machines takes minutes to return.
+
+## 0.2.58
+
+- **Fixed a process listing that could hang the hub.** Asking `ps` for the tty column never returns on this machine, and the hub's terminal matching asked for it on every lookup, so that path stalled indefinitely. This is the most likely reason terminal wake-ups went missing. Parent lookups no longer request tty at all, the terminal query is separate and time-boxed, and a stall now degrades to "no terminal data" instead of blocking. Measured after the fix: ancestry 60ms where it previously never returned.
+- Session resolution therefore works: with two agents spawned into the same directory, each resolved to its own transcript in about 200ms.
+
+## 0.2.57
+
+- Preserve partial-input warnings for every error after text submission, including a failed second process check or failed Enter write. Never describe these outcomes as safe to retry automatically.
+
+## 0.2.56
+
+- Send slash text and Enter as separate terminal writes, with a pause and fresh process check. Live Codex testing showed an immediate Enter is absorbed by paste-burst detection instead of submitting the command. Both writes stay bound to the exact terminal object.
+
+## 0.2.55
+
+- Add a local, authenticated terminal bridge in each VS Code window so Soph can discover, reveal, and submit slash commands to a selected integrated Codex or Claude Code terminal. Stable window/terminal IDs and a refreshed foreground process check reject closed/replaced targets; command receipts distinguish submitted input from verified execution.
+- Slash submission is separate from Agent Comms wake delivery. It requires an observed idle, empty input prompt and rejects multi-line/control input. No new dependencies or environment variables.
+
+## 0.2.54
+
+- **Spawned Codex agents are addressable under their own name immediately.** Codex launches MCP servers with a sanitized environment, so the persona the hub set on the terminal never reached the agent-comms bridge. The bridge connected unnamed, the hub refused to route to the spawn-assigned name, and the agent silently missed pings until it called `agent_comms_rename` itself. The persona, port, and profile id now ride in through `mcp_servers.agent-comms.env`, which Codex does pass through. Verified by reading the bridge process environment: before, all three were absent; after, all three are present. The router secret is deliberately not passed this way, because the launch command line is readable by any local process; the bridge still reads it from `~/.agent-comms/.env`.
+- **Terminal prompt injection is retired.** It depended on the agent's terminal being in a state that accepts synthetic input, which is exactly why pings went missing. `codex queue` replaces it. `agentComms.codexTerminalInjectionFallback` (off by default) brings it back as an escape hatch. When a queued delivery cannot be confirmed the hub now says so in the output channel instead of typing into the terminal, and the ping still reaches the agent over the websocket.
+- **A ping can no longer land in another agent's session.** Sessions were matched to agents by working directory and start time, so with several agents in one repository the newest session won, not the addressed one. The hub now walks up from the agent's bridge process to the Codex process that owns it and reads the transcript that process holds open, which identifies the session exactly. Demonstrated live: with a second session running in the same directory, directory matching returned the bystander's transcript while process matching returned the agent's own. The directory scan remains as a fallback when a process tree cannot be read.
+- When the process tree cannot be read, the directory fallback now declines instead of guessing. Two sessions in one directory are indistinguishable to it, and delivering a ping to the wrong agent is worse than not delivering. Transcript paths are also constrained to the Codex sessions directory, and the process walk reuses the hub's existing ancestry helper rather than a second implementation.
+- The launch-command env builder is driven by an allowlist of three names, so passing it a wider object cannot widen what reaches the command line. Its test now passes a secret-bearing key and asserts the key is dropped, rather than passing a clean object and asserting nothing leaked.
+
+## 0.2.50
+
+- **Codex inbound delivery no longer depends on the terminal.** Pings to a Codex agent are handed to the session with `codex queue --thread <id> --message <text>` instead of being typed into its VS Code terminal. An idle session picks the message up immediately; a busy session consumes it at the next turn boundary, so a working agent no longer loses pings. Measured on a live session: delivery confirmed 2.9s after queueing, and a message queued 0.1s into a 38s task was consumed 0.5s after that task finished.
+- **Every queued delivery is confirmed.** `codex queue` can report success when nothing is listening, so the hub waits for the ping to appear in the session's transcript before counting it delivered. Unconfirmed deliveries fall back to the old terminal injection, so nothing regresses when the CLI path is unavailable.
+- Threads are matched to personas by the agent's working directory and registration time, cached per agent process, and re-resolved when an agent reconnects.
+- New settings: `agentComms.codexQueueDelivery` (on by default), `agentComms.codexCliPath`, `agentComms.codexQueueConfirmMs`.
+- Output-channel lines for Codex now read `prompt=queue`, `prompt=inject`, or `prompt=skip` so the delivery path used is visible per ping.
+
 ## 0.2.49
 
 - **Spawn: reasoning effort + Codex model.** `/spawn` (and the `agent_comms_spawn` MCP tool) accept `effort` — claude `low|medium|high|xhigh|max` via `--effort`, codex `minimal|low|medium|high|xhigh` via `-c model_reasoning_effort` (`max` maps to `xhigh`). `model` is now also accepted for `kind='codex'` and passed to `codex -m`. Model allowlist gains `claude-fable-5-1` and `claude-opus-5`.

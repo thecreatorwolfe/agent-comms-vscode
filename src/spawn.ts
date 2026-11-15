@@ -81,6 +81,44 @@ function shellQuote(value: string): string {
   return `'${value.replace(/'/g, `'\\''`)}'`;
 }
 
+/**
+ * The only variables allowed onto a Codex launch command line. A command line
+ * is readable by any local process, so this list is enforced at runtime rather
+ * than by the type alone: a caller passing a wider object cannot widen what
+ * gets published.
+ */
+export const CODEX_BRIDGE_ENV_KEYS = [
+  'AGENT_COMMS_PERSONA',
+  'AGENT_COMMS_PORT',
+  'AGENT_COMMS_PROFILE_ID',
+] as const;
+
+/**
+ * Environment the agent-comms MCP subprocess needs in order to connect as the
+ * persona this spawn reserved. Never carries a secret.
+ */
+export type CodexBridgeEnv = Partial<Record<(typeof CODEX_BRIDGE_ENV_KEYS)[number], string>>;
+
+/**
+ * Codex launches MCP servers with a sanitized environment, so the terminal's
+ * env never reaches the agent-comms bridge and it connects unnamed. Codex does
+ * pass through `mcp_servers.<name>.env`, so the persona rides in as config.
+ */
+export function buildCodexBridgeEnvArgs(env: CodexBridgeEnv | undefined): string {
+  if (!env) {
+    return '';
+  }
+
+  // Driven by the allowlist, never by the caller's keys, so an unexpected
+  // property on the incoming object can never reach the command line.
+  return CODEX_BRIDGE_ENV_KEYS
+    .map((key) => [key, (env as Record<string, unknown>)[key]] as const)
+    .filter((entry): entry is readonly [typeof CODEX_BRIDGE_ENV_KEYS[number], string] =>
+      typeof entry[1] === 'string' && entry[1].length > 0)
+    .map(([key, value]) => ` -c ${shellQuote(`mcp_servers.agent-comms.env.${key}=${JSON.stringify(value)}`)}`)
+    .join('');
+}
+
 export function buildSpawnCommand(
   kind: 'claude' | 'codex',
   persona: string,
@@ -88,6 +126,7 @@ export function buildSpawnCommand(
   codexChromeDevtoolsStartupTimeoutSec?: number,
   model?: string | null,
   effort?: string | null,
+  codexBridgeEnv?: CodexBridgeEnv,
 ): string {
   const quotedBrief = shellQuote(briefFilePath);
   if (kind === 'claude') {
@@ -106,7 +145,9 @@ export function buildSpawnCommand(
     ? ` -c ${shellQuote(`mcp_servers.chrome-devtools.startup_timeout_sec=${codexChromeDevtoolsStartupTimeoutSec}`)}`
     : '';
 
-  return `~/.agent-comms/bin/codex-agent-comms${modelArg}${effortArg}${chromeDevtoolsTimeoutArg} "$(cat ${quotedBrief})"`;
+  const bridgeEnvArgs = buildCodexBridgeEnvArgs(codexBridgeEnv);
+
+  return `~/.agent-comms/bin/codex-agent-comms${modelArg}${effortArg}${chromeDevtoolsTimeoutArg}${bridgeEnvArgs} "$(cat ${quotedBrief})"`;
 }
 
 async function promptReuseExistingPersona(persona: string): Promise<boolean> {
@@ -197,6 +238,13 @@ export async function spawnAgent(req: SpawnRequest, dependencies: SpawnAgentDepe
       dependencies.codexChromeDevtoolsStartupTimeoutSec,
       req.model,
       req.effort,
+      req.kind === 'codex'
+        ? {
+          AGENT_COMMS_PERSONA: reservation.persona,
+          AGENT_COMMS_PORT: String(dependencies.extensionPort),
+          AGENT_COMMS_PROFILE_ID: reservation.profileId,
+        }
+        : undefined,
     ),
     true,
   );

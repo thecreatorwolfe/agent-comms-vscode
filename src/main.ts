@@ -1,4 +1,5 @@
 import { randomUUID } from 'node:crypto';
+import { readdir, readFile, stat } from 'node:fs/promises';
 import path from 'node:path';
 import * as vscode from 'vscode';
 import type { Logger } from 'pino';
@@ -15,6 +16,14 @@ import { ChannelInboundPoller, CHANNEL_POLL_INTERVAL_MS } from './slack/channel-
 import { parseAgentSlackEventText, parseHumanSlackControl, stripSlackUserMentions } from './slack/parse';
 import { postPersonaMessage, postSlackMessage, type PostedSlackMessage } from './slack/post';
 import { AgentRegistry, type AgentRecord } from './registry/agents';
+import {
+  CodexThreadIndex,
+  codexSessionsRoot,
+  createQueueDeliveryDeps,
+  deliverViaQueue,
+} from './codex/queue-delivery';
+import { relayTextToAgent } from './codex/agent-message';
+import { claudeHomeDir } from './claude/channel-delivery';
 import { SpawnedTerminalRegistry } from './registry/terminals';
 import { GatewayHttpServer } from './gateway/http';
 import { WsGateway } from './gateway/ws';
@@ -419,6 +428,118 @@ function buildActiveAgentPromptInput(
 ): string {
   const task = message.taskId ? ` Task: ${message.taskId}.` : '';
   return `Agent Comms ping from ${sender} to ${target}.${task} Stop and check Slack now with agent_comms_read_slack, then acknowledge or reply if needed. If you are already handling this ping, ignore this duplicate.`;
+}
+
+/** The part of the ping that identifies it inside a Codex transcript. */
+function buildCodexPingMarker(target: string, sender: string): string {
+  return `Agent Comms ping from ${sender} to ${target}`;
+}
+
+const codexThreadIndex = new CodexThreadIndex();
+const codexQueueDeps = createQueueDeliveryDeps();
+
+export type CodexWakeMode = 'queue' | 'inject' | 'skip';
+
+/**
+ * Terminal injection is retired. It depended on the terminal accepting
+ * synthetic input, which is why pings went missing, and `codex queue` covers
+ * the cases it was there for. The setting re-enables it as an escape hatch.
+ */
+function codexInjectionFallbackEnabled(configuration: vscode.WorkspaceConfiguration): boolean {
+  return configuration.get<boolean>('codexTerminalInjectionFallback') ?? false;
+}
+
+/**
+ * Wakes a Codex agent, preferring `codex queue` over terminal injection.
+ *
+ * The queue path hands the ping to the session itself, so it survives a busy
+ * agent and does not depend on the terminal accepting synthetic input. Terminal
+ * injection stays as the fallback for sessions whose thread cannot be resolved
+ * or confirmed, so nothing regresses when the CLI path is unavailable.
+ */
+async function wakeCodexAgent(
+  targetAgent: AgentRecord,
+  sender: string,
+  message: ParsedSlackMessage,
+  terminals: SpawnedTerminalRegistry,
+  outputChannel: vscode.OutputChannel,
+): Promise<CodexWakeMode> {
+  const configuration = vscode.workspace.getConfiguration('agentComms');
+  const queueEnabled = configuration.get<boolean>('codexQueueDelivery') ?? true;
+
+  if (queueEnabled) {
+    try {
+      const thread = await codexThreadIndex.lookup(
+        {
+          persona: targetAgent.persona,
+          cwd: targetAgent.cwd,
+          pid: targetAgent.pid,
+          connectedAt: targetAgent.connectedAt,
+        },
+        codexQueueDeps,
+        codexSessionsRoot(),
+      );
+
+      if (!thread) {
+        outputChannel.appendLine(
+          `[agent-comms] no Codex thread resolved for ${targetAgent.persona} in ${targetAgent.cwd}; falling back to terminal injection`,
+        );
+      } else {
+        const outcome = await deliverViaQueue(
+          {
+            cliPath: configuration.get<string>('codexCliPath') || 'codex',
+            threadId: thread.threadId,
+            rolloutPath: thread.rolloutPath,
+            message: buildActiveAgentPromptInput(targetAgent.persona, sender, message),
+            marker: buildCodexPingMarker(targetAgent.persona, sender),
+            confirmTimeoutMs: configuration.get<number>('codexQueueConfirmMs') ?? undefined,
+          },
+          codexQueueDeps,
+        );
+
+        if (outcome.ok) {
+          outputChannel.appendLine(
+            `[agent-comms] queued Agent Comms ping into Codex thread ${thread.threadId} for ${targetAgent.persona} `
+            + `confirmed in ${outcome.confirmedInMs}ms`,
+          );
+          return 'queue';
+        }
+
+        if (outcome.stage === 'confirm') {
+          // The CLI took it; it is pending in the session. Typing it into the
+          // terminal as well is how a lane reads the same ping twice.
+          outputChannel.appendLine(
+            `[agent-comms] codex queue delivery to ${targetAgent.persona} (thread ${thread.threadId}) accepted but unconfirmed: `
+            + `${outcome.reason}; NOT falling back — the message is already queued and injecting would duplicate it`,
+          );
+          return 'queue';
+        }
+
+        codexThreadIndex.forget(targetAgent.persona);
+        outputChannel.appendLine(
+          `[agent-comms] codex queue delivery to ${targetAgent.persona} (thread ${thread.threadId}) refused by the CLI: ${outcome.reason}; falling back to terminal injection`,
+        );
+      }
+    } catch (error) {
+      const detail = error instanceof Error ? error.message : String(error);
+      codexThreadIndex.forget(targetAgent.persona);
+      outputChannel.appendLine(
+        `[agent-comms] codex queue delivery errored for ${targetAgent.persona}: ${detail}; falling back to terminal injection`,
+      );
+    }
+  }
+
+  if (!codexInjectionFallbackEnabled(configuration)) {
+    outputChannel.appendLine(
+      `[agent-comms] no terminal-injection fallback for ${targetAgent.persona}; it is retired. `
+      + 'The ping still reached the bridge over the websocket. '
+      + 'Set agentComms.codexTerminalInjectionFallback to re-enable typing into the terminal.',
+    );
+    return 'skip';
+  }
+
+  const injected = await promptTrackedAgentTerminal(targetAgent, sender, message, terminals, outputChannel);
+  return injected ? 'inject' : 'skip';
 }
 
 async function promptTrackedAgentTerminal(
@@ -1115,38 +1236,38 @@ async function deliverParsedAgentMessage(
 
     if (!wasIdle && targetAgent.activity === 'working') {
       const eventAck = await wsGateway.waitForEventAck(deliveryId, 250);
-      const prompted = targetAgent.kind === 'codex'
-        ? await promptTrackedAgentTerminal(targetAgent, sender, message, terminals, outputChannel)
-        : false;
+      const wake: CodexWakeMode = targetAgent.kind === 'codex'
+        ? await wakeCodexAgent(targetAgent, sender, message, terminals, outputChannel)
+        : 'skip';
       void vscode.window.showInformationMessage(buildActiveAgentAttentionNotice(target, sender, message));
       outputChannel.appendLine(
         requiresImmediateAttention
-          ? `[agent-comms] ${traceSummary} high-priority active-working branch ${formatEventAckSummary(eventAck)}${prompted ? ' prompt=ok' : ' prompt=skip'}`
-          : `[agent-comms] ${traceSummary} active-working branch ${formatEventAckSummary(eventAck)}${prompted ? ' prompt=ok' : ' prompt=skip'}`,
+          ? `[agent-comms] ${traceSummary} high-priority active-working branch ${formatEventAckSummary(eventAck)} prompt=${wake}`
+          : `[agent-comms] ${traceSummary} active-working branch ${formatEventAckSummary(eventAck)} prompt=${wake}`,
       );
       return;
     }
 
     if (!wasIdle) {
       const eventAck = await wsGateway.waitForEventAck(deliveryId, 800);
-      const prompted = targetAgent.kind === 'codex'
-        ? await promptTrackedAgentTerminal(targetAgent, sender, message, terminals, outputChannel)
-        : false;
+      const wake: CodexWakeMode = targetAgent.kind === 'codex'
+        ? await wakeCodexAgent(targetAgent, sender, message, terminals, outputChannel)
+        : 'skip';
       void vscode.window.showInformationMessage(buildActiveAgentAttentionNotice(target, sender, message));
       outputChannel.appendLine(
-        `[agent-comms] ${traceSummary} active-waiting branch ${formatEventAckSummary(eventAck)}${prompted ? ' prompt=ok' : targetAgent.kind === 'codex' ? ' prompt=skip' : ''}`,
+        `[agent-comms] ${traceSummary} active-waiting branch ${formatEventAckSummary(eventAck)}${targetAgent.kind === 'codex' ? ` prompt=${wake}` : ''}`,
       );
       return;
     }
 
     const eventAck = await wsGateway.waitForEventAck(deliveryId, 800);
     registry.markResume(target, message.taskId);
-    const prompted = targetAgent.kind === 'codex'
-      ? await promptTrackedAgentTerminal(targetAgent, sender, message, terminals, outputChannel)
-      : false;
+    const wake: CodexWakeMode = targetAgent.kind === 'codex'
+      ? await wakeCodexAgent(targetAgent, sender, message, terminals, outputChannel)
+      : 'skip';
     void vscode.window.showInformationMessage(buildActiveAgentAttentionNotice(target, sender, message));
     outputChannel.appendLine(
-      `[agent-comms] ${traceSummary} idle branch ${formatEventAckSummary(eventAck)} resume=ok${prompted ? ' prompt=ok' : targetAgent.kind === 'codex' ? ' prompt=skip' : ''}`,
+      `[agent-comms] ${traceSummary} idle branch ${formatEventAckSummary(eventAck)} resume=ok${targetAgent.kind === 'codex' ? ` prompt=${wake}` : ''}`,
     );
   }));
 }
@@ -1436,6 +1557,52 @@ export async function bootstrap(
     ),
     onReadSlack: async (request) => handleReadSlackHistory(slackRuntime, env, request),
     onRename: async (request) => handleRenameRequest(request, registry, terminals, wsGateway, profileStore, outputChannel),
+    onAgentMessage: async (request) => {
+      const result = await relayTextToAgent(
+        {
+          persona: request.persona,
+          text: request.text,
+          sender: request.sender ?? null,
+          confirmTimeoutMs: request.confirm_timeout_ms ?? null,
+        },
+        {
+          // registry.get() still returns an agent inside its disconnect grace
+          // window; list() is the one that excludes them. A lane that has gone
+          // must be a refusal, not a queue write nobody will read.
+          findAgent: (persona) => registry.list().find((agent) => agent.persona === persona),
+          threadIndex: codexThreadIndex,
+          queueDeps: codexQueueDeps,
+          sessionsRoot: codexSessionsRoot(),
+          cliPath: vscode.workspace.getConfiguration('agentComms').get<string>('codexCliPath') || 'codex',
+          defaultSender: 'Nick, relayed by Soph',
+          newDeliveryId: () => randomUUID().slice(0, 8),
+          newEventId: () => randomUUID(),
+          // Claude lanes: one event frame down the lane's own bridge socket (the
+          // route Slack pings take), confirmed against the session transcript.
+          claude: {
+            pushEvent: (frame) => wsGateway.sendEvent(frame),
+            waitForAck: (deliveryId, timeoutMs) => wsGateway.waitForEventAck(deliveryId, timeoutMs),
+            ancestorPids: codexQueueDeps.ancestorPids,
+            readText: async (filePath) => {
+              try { return await readFile(filePath, 'utf8'); } catch { return null; }
+            },
+            listDir: (dirPath) => readdir(dirPath),
+            mtimeMs: async (filePath) => {
+              try { return (await stat(filePath)).mtimeMs; } catch { return null; }
+            },
+            claudeHome: claudeHomeDir(),
+            now: () => Date.now(),
+            sleep: (ms) => new Promise((resolve) => setTimeout(resolve, ms)),
+          },
+        },
+      );
+      outputChannel.appendLine(
+        `[agent-comms] relayed ${result.text_chars} chars to ${result.persona} `
+        + `(${result.transport} ${result.thread_id ?? result.session_id ?? 'session unidentified'}, `
+        + `${result.delivery}, lane was ${result.activity})`,
+      );
+      return result;
+    },
   });
 
   wsGateway = new WsGateway({
